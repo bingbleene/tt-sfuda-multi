@@ -1,24 +1,25 @@
 """
-tt_sfuda_2d_dualema.py
-=======================
-Entrypoint cho Pha 5 (Dual/Multi-EMA Teacher). KHONG sua tt_sfuda_2d.py goc -
-file nay import lai toan bo ham dung duoc (Stage I, augmentation, loss...)
-tu tt_sfuda_2d.py, chi viet lai sfuda_task() de dung MultiTeacherManager
-thay vi 1 teacher don.
+tt_sfuda_2d_dualema.py (v2)
+============================
+Them 2 tham so CLI so voi ban v1, de sweep nhanh khong can sua file:
+  --ensemble_mode {mean, weighted, confidence}  (chi anh huong topology=parallel)
+  --slow_keep_rate <float>   (ghi de keep_rate cua teacher 'slow' trong yaml,
+                               vd de sweep 0.993/0.995/0.997/0.999)
+  --fast_weight <float>      (dung khi ensemble_mode='weighted', trong so cua
+                               teacher 'fast'; trong so 'slow' = 1 - fast_weight)
 
-Cach chay (dat cung thu muc voi archs.py, dataset.py, losses.py, utils.py,
-multi_teacher.py va tt_sfuda_2d.py goc):
+Cach chay (vi du sweep nhanh keep_rate cho cascaded/parallel):
+    python run.py tt_sfuda_2d_dualema.py --source chase_unet --target rite \
+        --topology parallel --ensemble_mode confidence
 
-    python tt_sfuda_2d_dualema.py --source chase_unet --target rite \
-        --topology parallel
+    python run.py tt_sfuda_2d_dualema.py --source chase_unet --target rite \
+        --topology parallel --ensemble_mode weighted --fast_weight 0.8
 
-    python tt_sfuda_2d_dualema.py --source chase_unet --target rite \
-        --topology cascaded
-
-Doc config tu models/<source>/config_<target>_dualema.yml (file MOI, xem
-README_dualema.md de biet cac key can them: teachers, topology).
+    python run.py tt_sfuda_2d_dualema.py --source chase_unet --target rite \
+        --topology cascaded --slow_keep_rate 0.995
 """
 import os
+import json
 import yaml
 import argparse
 from glob import glob
@@ -40,14 +41,10 @@ from metrics import iou_score
 from utils import AverageMeter
 from multi_teacher import MultiTeacherManager
 
-# tai su dung nguyen ven tu file goc - KHONG copy-paste lai logic
 from tt_sfuda_2d import (
     build_strong_augmentation,
-    build_pseduo_augmentation,
     consistency_loss,
-    sigmoid_entropy_loss,
-    uncert_voting,
-    sfuda_target,   # Stage I giu nguyen, khong lien quan den teacher
+    sfuda_target,
     validate,
 )
 
@@ -59,19 +56,19 @@ def parse_args():
     parser.add_argument('--source', default=None)
     parser.add_argument('--target', default=None)
     parser.add_argument('--topology', default='parallel', choices=['parallel', 'cascaded'])
+    parser.add_argument('--ensemble_mode', default='mean', choices=['mean', 'weighted', 'confidence'])
+    parser.add_argument('--slow_keep_rate', type=float, default=None,
+                         help='Neu dat, ghi de keep_rate cua teacher "slow" tu yaml')
+    parser.add_argument('--fast_weight', type=float, default=None,
+                         help='Neu dat, ghi de weight cua teacher "fast" (dung voi ensemble_mode=weighted)')
+    parser.add_argument('--results_csv', default='results_dualema.csv',
+                         help='File CSV de append ket qua, phuc vu sweep nhieu lan')
     return parser.parse_args()
 
 
-def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion, optimizer):
-    """
-    Ban sao cua sfuda_task() goc (tt_sfuda_2d.py dong 184-226), CHI khac o
-    2 diem:
-      1. msrc_model (1 teacher) -> teacher_manager (N teacher, xem multi_teacher.py)
-      2. update_teacher_model(...) don le -> teacher_manager.update(...)
-    Phan con lai (augmentation, seg_loss, const_loss) giu NGUYEN logic goc.
-    """
+def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion, optimizer, ensemble_mode):
     avg_meters = {'loss': AverageMeter(), 'iou': AverageMeter()}
-    teacher_manager.train_mode(False)  # tat ca teacher o eval mode
+    teacher_manager.train_mode(False)
     tgt_model.train()
     pbar = tqdm(total=len(train_loader))
 
@@ -82,7 +79,7 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
         s_input = image_strong_aug.unsqueeze(0).cuda()
 
         with torch.no_grad():
-            w_output, msrc_feat = teacher_manager.predict(w_input, mode='const')
+            w_output, msrc_feat = teacher_manager.predict(w_input, mode='const', ensemble_mode=ensemble_mode)
             ps_output = w_output.detach().clone()
             ps_output[ps_output >= 0.5] = 1
             ps_output[ps_output < 0.5] = 0
@@ -106,7 +103,7 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
         pbar.set_postfix(postfix)
         pbar.update(1)
 
-        teacher_manager.update(tgt_model)   # <-- khac biet duy nhat so voi ban goc
+        teacher_manager.update(tgt_model)
 
     pbar.close()
     return OrderedDict([('loss', avg_meters['loss'].avg),
@@ -119,6 +116,19 @@ def main():
     config_file = "config_" + args.target + "_dualema"
     with open('models/%s/%s.yml' % (args.source, config_file), 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
+
+    # ---- ghi de teacher config qua CLI, khong can sua yaml moi lan sweep ----
+    teachers = config['teachers']
+    if args.slow_keep_rate is not None:
+        for t in teachers:
+            if t['name'] == 'slow':
+                t['keep_rate'] = args.slow_keep_rate
+    if args.fast_weight is not None:
+        for t in teachers:
+            if t['name'] == 'fast':
+                t['weight'] = args.fast_weight
+            elif t['name'] == 'slow':
+                t['weight'] = 1.0 - args.fast_weight
 
     train_img_ids = glob(os.path.join('inputs', args.target, 'train', 'images', '*' + config['img_ext']))
     train_img_ids = [os.path.splitext(os.path.basename(p))[0] for p in train_img_ids]
@@ -187,7 +197,8 @@ def main():
     print("")
     print("Performing source only model evaluation...!!!")
     val_log = validate(val_loader, msrc_model, criterion)
-    print('Source_only dice: %.4f' % (val_log['dice']))
+    source_only_dice = val_log['dice']   # luu rieng - val_log se bi ghi de sau khi adapt xong
+    print('Source_only dice: %.4f' % (source_only_dice))
 
     print("")
     print("Target specific adaptation (Stage I - giong het baseline)...!!!")
@@ -200,29 +211,50 @@ def main():
     tgt_model.cuda()
     tgt_model.train()
 
-    # ==== Diem khac biet chinh: khoi tao MultiTeacherManager thay vi 1 teacher ====
     print("")
-    print(f"Khoi tao {len(config['teachers'])} teacher, topology='{args.topology}': "
-          f"{[(t['name'], t['keep_rate']) for t in config['teachers']]}")
-    teacher_manager = MultiTeacherManager(config['teachers'], topology=args.topology)
+    print(f"Khoi tao {len(teachers)} teacher, topology='{args.topology}', "
+          f"ensemble_mode='{args.ensemble_mode}': {teachers}")
+    teacher_manager = MultiTeacherManager(teachers, topology=args.topology)
     teacher_manager.init_from(msrc_model)
     teacher_manager.cuda()
 
     print("")
     print("Task specific adaptation (Stage II - Multi-EMA Teacher)...!!!")
     for epoch in range(config['stage2']):
-        train_log = sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion, tgt_optimizer)
+        train_log = sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
+                                             tgt_optimizer, args.ensemble_mode)
         print('train_loss %.4f - train_iou %.4f' % (train_log['loss'], train_log['iou']))
 
     print("")
     print("Performing adapted target model evaluation...!!!")
     val_log = validate(val_loader, tgt_model, criterion)
-    print('Adapted target model (multi-teacher, %s) dice: %.4f' % (args.topology, val_log['dice']))
+    print('Adapted target model (multi-teacher, %s, %s) dice: %.4f' %
+          (args.topology, args.ensemble_mode, val_log['dice']))
 
-    out_dir = f"outputs/{config['name']}_dualema_{args.topology}"
+    tag = f"{args.topology}_{args.ensemble_mode}"
+    if args.slow_keep_rate is not None:
+        tag += f"_slowkr{args.slow_keep_rate}"
+    if args.fast_weight is not None:
+        tag += f"_fw{args.fast_weight}"
+
+    out_dir = f"outputs/{config['name']}_dualema_{tag}_to_{args.target}"
     os.makedirs(out_dir, exist_ok=True)
     torch.save(tgt_model.state_dict(), os.path.join(out_dir, 'model.pth'))
-    print(f"Da luu checkpoint tai {out_dir}/model.pth")
+
+    # ---- ghi ket qua vao CSV de tien tong hop, khong ghi de - append ----
+    row = {
+        'source': args.source, 'target': args.target,
+        'topology': args.topology, 'ensemble_mode': args.ensemble_mode,
+        'slow_keep_rate': args.slow_keep_rate, 'fast_weight': args.fast_weight,
+        'source_only_dice': source_only_dice,
+        'adapted_dice': val_log['dice'],
+    }
+    write_header = not os.path.exists(args.results_csv)
+    with open(args.results_csv, 'a') as f:
+        if write_header:
+            f.write(','.join(row.keys()) + '\n')
+        f.write(','.join(str(v) for v in row.values()) + '\n')
+    print(f"Da ghi ket qua vao {args.results_csv}")
 
 
 if __name__ == '__main__':
