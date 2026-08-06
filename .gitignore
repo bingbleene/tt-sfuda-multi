@@ -1,0 +1,33 @@
+# ==== Data & checkpoints (qua Kaggle Dataset, khong len Git) ====
+TT_SFUDA_2D/inputs/
+TT_SFUDA_2D/models/*/model.pth
+TT_SFUDA_2D/models/*/*.pth
+TT_SFUDA_3D/data/
+TT_SFUDA_3D/ckpts/
+*.pth
+*.tar
+*.pt
+
+# ==== Outputs / logs ====
+TT_SFUDA_2D/outputs/
+TT_SFUDA_3D/output/
+logs/
+*.log
+results/comparison_table.csv
+
+# ==== Python ====
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+env/
+
+# ==== OS / editor ====
+.DS_Store
+.vscode/
+*.swp
+
+# ==== Kaggle ====
+kaggle.json
