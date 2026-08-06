@@ -32,3 +32,31 @@ _fake.Flip = lambda always_apply=False, p=0.5: A.OneOf(
     [A.HorizontalFlip(p=1.0), A.VerticalFlip(p=1.0)], p=p
 )
 sys.modules['albumentations.augmentations.transforms'] = _fake
+
+
+# ============================================================
+# Va 2: torchvision RandomSolarize - ban torchvision moi (>=0.17) kiem tra
+# nghiem ngat threshold < bound cua anh (bound=1.0 cho anh float, 255.0 cho
+# uint8). Code goc dung threshold=192.0 (quy uoc uint8 [0,255] cua ban cu),
+# nhung anh thuc te trong pipeline la tensor float [~0,1] (sau Normalize
+# cua albumentations + /255 trong dataset.py) -> vuot bound, bi TypeError.
+#
+# Vien: khi threshold >= bound cua anh float, QUY DOI TY LE tuong duong
+# (threshold/255 * bound) thay vi bo qua hoan toan buoc solarize - giu dung
+# tinh than "solarize 1 phan anh" cua augmentation goc thay vi vo hieu hoa no.
+# ============================================================
+import torch
+import torchvision.transforms.functional as _TF
+
+_original_solarize = _TF.solarize
+
+
+def _patched_solarize(img, threshold):
+    if isinstance(img, torch.Tensor) and img.is_floating_point():
+        bound = 1.0
+        if threshold >= bound:
+            threshold = min((threshold / 255.0) * bound, bound - 1e-6)
+    return _original_solarize(img, threshold)
+
+
+_TF.solarize = _patched_solarize
