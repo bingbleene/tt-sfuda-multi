@@ -1,29 +1,29 @@
 """
-unsupervised_early_stop.py
-=============================
-Early-stopping KHONG dung label dich - chi dua tren thong ke DU DOAN cua
-chinh model (khong can ground truth). Y tuong: neu model dang suy thoai
-(nhu quan sat duoc khi keo dai Stage II qua 20 epoch - Dice sup tu 0.581
-xuong 0.508), thuong di kem voi TY LE PIXEL DU DOAN DUONG TINH thay doi
-DOT NGOT (over-segment hoac collapse ve toan nen) - day la tin hieu co
-the do ma KHONG can label, dung dung tinh than cua diagnose_gap_v2.py.
+unsupervised_early_stop.py (v2)
+==================================
+SUA LOI THUC TE phat hien duoc: ban v1 dung (a) trung binh TOAN BO lich su
+lam baseline - cang nhieu epoch cang bi lam muot/pha loang, mat do nhay voi
+xu huong dai han; (b) yeu cau 3 epoch BAT ON LIEN TIEP - tin hieu nhieu
+(dao dong manh moi epoch) khien chuoi lien tiep khong bao gio du dai, du
+co xu huong troi dat that su qua nhieu epoch (xac nhan bang du lieu that:
+chuoi ty le tang dan tu ~0.13 (10 epoch dau) len ~0.17 (10 epoch sau) -
+troi dat ro rang, nhung KHONG epoch nao bi bat vi luon bi ngat giua chung
+boi 1 epoch "on dinh" ngau nhien).
 
-KHOA CHAT viec khong dung label: thay vi tai su dung train_loader (von
-doc CA anh LAN mask tu dataset.py, chi lo di mask qua dau '_') - lop
-ImageOnlyDataset ben duoi CHI DOC FILE ANH, KHONG BAO GIO MO thu muc
-mask - ve mat cau truc KHONG THE nao lo label vao duoc, du code sau nay
-co sua sai the nao di nua.
+Sua bang 2 thay doi:
+  1. Baseline = trung binh cua N epoch DAU TIEN (co dinh, khong tiep tuc
+     cap nhat theo thoi gian) - phat hien DUNG xu huong "da di xa khoi
+     diem khoi dau on dinh" thay vi so voi trung binh dang tu lam muot.
+  2. Dung "K bat on trong M epoch gan nhat" (khong bat buoc LIEN TIEP) thay
+     vi "N lien tiep" - chiu duoc nhieu ngau nhien tung epoch, van bat duoc
+     xu huong dai han.
 
-Thuat toan:
-  1. Sau moi epoch, do ty le pixel du doan duong tinh tren tap anh dich
-     (qua ImageOnlyDataset - KHONG CO KHAI NIEM mask trong luong du lieu nay).
-  2. So sanh voi trung binh cac epoch TRUOC DO (khong tinh epoch hien tai).
-  3. Neu do lech tuong doi > nguong -> danh dau 1 epoch "bat on".
-  4. Neu so epoch bat on LIEN TIEP dat patience -> DUNG, quay ve checkpoint
-     cua epoch ON DINH GAN NHAT (luu san moi khi phat hien on dinh).
+Y tuong tin hieu (ty le pixel du doan duong tinh, khong can label) giu
+nguyen - chi sua CACH DIEN GIAI tin hieu do.
 """
 import os
 import copy
+from collections import deque
 from glob import glob
 
 import cv2
@@ -36,18 +36,9 @@ from dataset import Dataset as _OriginalDataset
 
 class ImageOnlyDataset(_OriginalDataset):
     """
-    KE THUA truc tiep tu dataset.Dataset goc - thay vi viet lai transform
-    pipeline tu dau (cach lam CU cua file nay, da gay 2 loi thuc te: thieu
-    Normalize, thieu RandomRotate90/Flip, khien anh dua vao model lech
-    phan bo so voi luc train). Ke thua dam bao PIXEL-FOR-PIXEL giong het
-    Dataset goc vi DUNG CHUNG dung 1 doan code transform, khong co nguy co
-    lech do viet lai thu cong.
-
-    CHI ghi de __getitem__ de BO MASK khoi gia tri tra ve - dam bao class
-    nay khong the "lo" mask ra cho code ben ngoai (vd early-stop), du ben
-    trong van phai doc file mask (vi ke thua init tu Dataset goc, can
-    mask_dir hop le) - day la danh doi hop ly: uu tien TRUNG THUC ve tien
-    xu ly hon la "sach tuyet doi" ve viec khong dung toi file mask.
+    KE THUA truc tiep tu dataset.Dataset goc - dam bao PIXEL-FOR-PIXEL giong
+    het (dung chung code transform, khong co nguy co lech do viet lai thu
+    cong). CHI ghi de __getitem__ de BO MASK khoi gia tri tra ve.
     """
 
     def __getitem__(self, idx):
@@ -56,20 +47,34 @@ class ImageOnlyDataset(_OriginalDataset):
 
 
 class UnsupervisedEarlyStopper:
-    def __init__(self, patience=3, ratio_change_threshold=0.20):
-        self.patience = patience
+    def __init__(self, warmup_epochs=3, window_size=5, unstable_count_threshold=3,
+                 ratio_change_threshold=0.20):
+        """
+        warmup_epochs: so epoch DAU dung de tinh baseline CO DINH (khong
+            doi sau do) - can it nhat warmup_epochs epoch truoc khi bat dau
+            danh gia on dinh/bat on.
+        window_size: kich thuoc cua so truot de dem so epoch bat on GAN DAY
+            (khong yeu cau lien tiep).
+        unstable_count_threshold: so epoch bat on TRONG CUA SO GAN NHAT de
+            kich hoat dung (vd 3 trong 5 epoch gan nhat, khong can lien tiep).
+        """
+        self.warmup_epochs = warmup_epochs
+        self.window_size = window_size
+        self.unstable_count_threshold = unstable_count_threshold
         self.ratio_change_threshold = ratio_change_threshold
+
         self.ratio_history = []
+        self.baseline = None   # CO DINH sau khi du warmup_epochs, KHONG doi nua
+        self.recent_stability = deque(maxlen=window_size)  # True=on dinh, False=bat on
+
         self.best_state_dict = None
         self.best_epoch = -1
-        self.unstable_streak = 0
-        self._loader = None  # khoi tao 1 lan duy nhat trong check(), tai su dung
 
     @torch.no_grad()
     def _predicted_positive_ratio(self, model, image_only_loader):
         model.eval()
         total_ratio, n = 0.0, 0
-        for input in image_only_loader:   # CHI co anh - KHONG CO CHO cho mask/label
+        for input in image_only_loader:
             input = input.cuda()
             output = model(input)
             prob = torch.sigmoid(output)
@@ -80,36 +85,45 @@ class UnsupervisedEarlyStopper:
         return total_ratio / n
 
     def check(self, model, image_only_loader, epoch_idx, verbose=True):
-        """Goi sau MOI epoch. `image_only_loader` PHAI la DataLoader boc
-        ImageOnlyDataset (khong phai train_loader thuong). Tra ve True neu
-        nen DUNG training tai day."""
+        """Goi sau MOI epoch. Tra ve True neu nen DUNG training tai day."""
         ratio = self._predicted_positive_ratio(model, image_only_loader)
         self.ratio_history.append(ratio)
 
-        if len(self.ratio_history) == 1:
+        # ==== Giai doan warmup: chua du du lieu de co baseline on dinh ====
+        if len(self.ratio_history) <= self.warmup_epochs:
             self.best_state_dict = copy.deepcopy(model.state_dict())
             self.best_epoch = epoch_idx
+            if len(self.ratio_history) == self.warmup_epochs:
+                # dung TRUNG VI (median) thay vi trung binh - do bot nhay
+                # voi 1 epoch bat thuong don le trong giai doan warmup ngan
+                sorted_hist = sorted(self.ratio_history)
+                mid = len(sorted_hist) // 2
+                self.baseline = (sorted_hist[mid] if len(sorted_hist) % 2 == 1
+                                 else (sorted_hist[mid-1] + sorted_hist[mid]) / 2)
             if verbose:
-                print(f"  [EarlyStop-KGS] epoch {epoch_idx}: ty le du doan={ratio:.4f} (epoch dau, luu lam moc)")
+                print(f"  [EarlyStop-KGS] epoch {epoch_idx}: ty le du doan={ratio:.4f} "
+                      f"(warmup {len(self.ratio_history)}/{self.warmup_epochs})")
             return False
 
-        baseline = sum(self.ratio_history[:-1]) / len(self.ratio_history[:-1])
-        relative_change = abs(ratio - baseline) / (baseline + 1e-6)
+        # ==== Sau warmup: so voi baseline CO DINH (khong doi theo thoi gian) ====
+        relative_change = abs(ratio - self.baseline) / (self.baseline + 1e-6)
         is_stable = relative_change <= self.ratio_change_threshold
+        self.recent_stability.append(is_stable)
 
         if is_stable:
-            self.unstable_streak = 0
             self.best_state_dict = copy.deepcopy(model.state_dict())
             self.best_epoch = epoch_idx
-        else:
-            self.unstable_streak += 1
+
+        unstable_in_window = sum(1 for s in self.recent_stability if not s)
 
         if verbose:
-            status = 'ON DINH' if is_stable else f'BAT ON ({self.unstable_streak}/{self.patience})'
+            status = 'ON DINH' if is_stable else 'BAT ON'
             print(f"  [EarlyStop-KGS] epoch {epoch_idx}: ty le du doan={ratio:.4f}, "
-                  f"trung binh truoc do={baseline:.4f}, lech={relative_change*100:.1f}% -> {status}")
+                  f"baseline CO DINH={self.baseline:.4f}, lech={relative_change*100:.1f}% -> {status} "
+                  f"(bat on {unstable_in_window}/{len(self.recent_stability)} trong {self.window_size} epoch gan nhat)")
 
-        return self.unstable_streak >= self.patience
+        return (len(self.recent_stability) == self.window_size and
+                unstable_in_window >= self.unstable_count_threshold)
 
     def restore_best(self, model):
         if self.best_state_dict is not None:

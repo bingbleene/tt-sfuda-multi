@@ -111,7 +111,12 @@ def parse_args():
                               'tinh. Dung KET HOP voi --stage2_epochs de dat SO '
                               'EPOCH LON, roi de co che nay tu dung dung som neu '
                               'phat hien bat on.')
-    parser.add_argument('--early_stop_patience', type=int, default=3)
+    parser.add_argument('--early_stop_warmup', type=int, default=3,
+                         help='So epoch dau dung tinh baseline CO DINH (khong doi sau do)')
+    parser.add_argument('--early_stop_window', type=int, default=5,
+                         help='Kich thuoc cua so truot de dem epoch bat on GAN DAY')
+    parser.add_argument('--early_stop_unstable_count', type=int, default=3,
+                         help='So epoch bat on TRONG cua so gan nhat de kich hoat dung (khong can lien tiep)')
     parser.add_argument('--early_stop_threshold', type=float, default=0.20)
     return parser.parse_args()
 
@@ -338,7 +343,9 @@ def main():
           f"({'ghi de tu --stage2_epochs' if args.stage2_epochs is not None else 'tu config goc'})")
 
     early_stopper = UnsupervisedEarlyStopper(
-        patience=args.early_stop_patience,
+        warmup_epochs=args.early_stop_warmup,
+        window_size=args.early_stop_window,
+        unstable_count_threshold=args.early_stop_unstable_count,
         ratio_change_threshold=args.early_stop_threshold) if args.early_stop_unsupervised else None
 
     image_only_loader = None
