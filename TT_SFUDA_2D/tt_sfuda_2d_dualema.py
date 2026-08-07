@@ -343,20 +343,31 @@ def main():
 
     image_only_loader = None
     if early_stopper is not None:
-        # loader RIENG, khong di qua dataset.Dataset goc (von co doc mask) -
-        # ve mat cau truc KHONG THE nao lo label vao co che early-stop
+        # ImageOnlyDataset KE THUA Dataset goc (xem unsupervised_early_stop.py)
+        # - dam bao pixel giong tuyet doi, chi khac o cho KHONG tra ve mask.
+        # Van phai truyen mask_dir hop le (lop cha can de doc, du bi bo o
+        # __getitem__ cua lop con) - day la du lieu THAT, khong phai gia.
+
+        # image_only_loader: dung val_transform (KHONG augmentation ngau
+        # nhien) - do ty le du doan can ON DINH qua cac epoch de phat hien
+        # troi dat that su, tranh nhieu tu augmentation ngau nhien.
         image_only_ds = ImageOnlyDataset(
+            img_ids=train_img_ids,
             img_dir=os.path.join('inputs', args.target, 'train', 'images'),
-            img_ext=config['img_ext'], input_h=config['input_h'], input_w=config['input_w'])
+            mask_dir=os.path.join('inputs', args.target, 'train', 'masks'),
+            img_ext=config['img_ext'], mask_ext=config['mask_ext'],
+            num_classes=config['num_classes'], transform=val_transform)
         image_only_loader = torch.utils.data.DataLoader(image_only_ds, batch_size=4, shuffle=False, num_workers=2)
 
-        # DUNG HAN train_loader (co mask) cho CA vong lap Stage II khi dang
-        # thu nghiem early_stop_unsupervised - thay bang loader anh thuan
-        # tuy, batch_size=1 de tuong thich voi build_strong_augmentation
-        # (gia dinh batch=1, xem input.squeeze(0) trong sfuda_task_multiteacher)
+        # stage2_train_loader: dung train_transform (CO augmentation, giong
+        # het du lieu train_loader goc dua vao model) - chi khac o cho
+        # KHONG BAO GIO tra ve mask cho vong lap Stage II.
         stage2_train_ds = ImageOnlyDataset(
+            img_ids=train_img_ids,
             img_dir=os.path.join('inputs', args.target, 'train', 'images'),
-            img_ext=config['img_ext'], input_h=config['input_h'], input_w=config['input_w'])
+            mask_dir=os.path.join('inputs', args.target, 'train', 'masks'),
+            img_ext=config['img_ext'], mask_ext=config['mask_ext'],
+            num_classes=config['num_classes'], transform=train_transform)
         stage2_train_loader = torch.utils.data.DataLoader(
             stage2_train_ds, batch_size=1, shuffle=True, num_workers=config['num_workers'], drop_last=True)
     else:

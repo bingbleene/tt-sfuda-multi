@@ -29,29 +29,30 @@ from glob import glob
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
+
+from dataset import Dataset as _OriginalDataset
 
 
-class ImageOnlyDataset(Dataset):
-    """CHI doc anh, KHONG BAO GIO mo thu muc mask - khac voi dataset.Dataset
-    goc (doc ca anh lan mask). Dung rieng cho cac co che khong giam sat
-    (early-stop, chan doan domain gap...) de dam bao KHONG THE lo label."""
+class ImageOnlyDataset(_OriginalDataset):
+    """
+    KE THUA truc tiep tu dataset.Dataset goc - thay vi viet lai transform
+    pipeline tu dau (cach lam CU cua file nay, da gay 2 loi thuc te: thieu
+    Normalize, thieu RandomRotate90/Flip, khien anh dua vao model lech
+    phan bo so voi luc train). Ke thua dam bao PIXEL-FOR-PIXEL giong het
+    Dataset goc vi DUNG CHUNG dung 1 doan code transform, khong co nguy co
+    lech do viet lai thu cong.
 
-    def __init__(self, img_dir, img_ext, input_h, input_w):
-        self.img_paths = sorted(glob(os.path.join(img_dir, '*' + img_ext)))
-        assert len(self.img_paths) > 0, f"Khong tim thay anh nao trong {img_dir}"
-        self.input_h = input_h
-        self.input_w = input_w
-
-    def __len__(self):
-        return len(self.img_paths)
+    CHI ghi de __getitem__ de BO MASK khoi gia tri tra ve - dam bao class
+    nay khong the "lo" mask ra cho code ben ngoai (vd early-stop), du ben
+    trong van phai doc file mask (vi ke thua init tu Dataset goc, can
+    mask_dir hop le) - day la danh doi hop ly: uu tien TRUNG THUC ve tien
+    xu ly hon la "sach tuyet doi" ve viec khong dung toi file mask.
+    """
 
     def __getitem__(self, idx):
-        img = cv2.imread(self.img_paths[idx])
-        img = cv2.resize(img, (self.input_w, self.input_h))
-        img = img.astype('float32') / 255
-        img = img.transpose(2, 0, 1)
-        return img
+        img, mask, img_id = super().__getitem__(idx)
+        return img  # CHI tra ve anh, khong bao gio tra ve mask
 
 
 class UnsupervisedEarlyStopper:
