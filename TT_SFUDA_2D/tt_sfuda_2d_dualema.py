@@ -117,7 +117,14 @@ def parse_args():
 
 
 def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion, optimizer,
-                             ensemble_mode, class_balance_tracker=None):
+                             ensemble_mode, class_balance_tracker=None, labels_available=True):
+    """
+    labels_available=False: train_loader la loader ANH THUAN TUY (khong co
+    mask, vd tu ImageOnlyDataset) - dung khi thu nghiem early_stop_unsupervised,
+    de dam bao KHONG co label nao bi cham vao trong SUOT vong lap Stage II,
+    ke ca chi de log train_iou (von von KHONG dung trong loss/backward, nhung
+    van "cham" vao label neu con doc no tu dia).
+    """
     avg_meters = {'loss': AverageMeter(), 'iou': AverageMeter()}
     teacher_manager.train_mode(False)
     tgt_model.train()
@@ -126,9 +133,15 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
     calibrated_criterion = CalibratedBCEDiceLoss() if class_balance_tracker is not None else None
     mean_trust_ratio = AverageMeter()
 
-    for input, target, _ in train_loader:
+    for batch in train_loader:
+        if labels_available:
+            input, target, _ = batch
+            target = target.cuda()
+        else:
+            input = batch   # ImageOnlyDataset chi tra ve 1 tensor anh, khong co gi khac
+            target = None
+
         w_input = input.cuda()
-        target = target.cuda()
         image_strong_aug = build_strong_augmentation(input.squeeze(0))
         s_input = image_strong_aug.unsqueeze(0).cuda()
 
@@ -159,14 +172,14 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
         loss.backward()
         optimizer.step()
 
-        iou, dice = iou_score(output, target)
         avg_meters['loss'].update(loss.item(), input.size(0))
-        avg_meters['iou'].update(iou, input.size(0))
+        if labels_available:
+            iou, dice = iou_score(output, target)
+            avg_meters['iou'].update(iou, input.size(0))
 
-        postfix = OrderedDict([
-            ('loss', avg_meters['loss'].avg),
-            ('iou', avg_meters['iou'].avg),
-        ])
+        postfix = OrderedDict([('loss', avg_meters['loss'].avg)])
+        if labels_available:
+            postfix['iou'] = avg_meters['iou'].avg
         if ensemble_mode == 'trust_region':
             postfix['trust%'] = mean_trust_ratio.avg
         if class_balance_tracker is not None:
@@ -179,8 +192,9 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
         teacher_manager.update(tgt_model)
 
     pbar.close()
-    result = OrderedDict([('loss', avg_meters['loss'].avg),
-                           ('iou', avg_meters['iou'].avg)])
+    result = OrderedDict([('loss', avg_meters['loss'].avg)])
+    if labels_available:
+        result['iou'] = avg_meters['iou'].avg
     if ensemble_mode == 'trust_region':
         result['trust_ratio'] = mean_trust_ratio.avg
     if class_balance_tracker is not None:
@@ -336,26 +350,44 @@ def main():
             img_ext=config['img_ext'], input_h=config['input_h'], input_w=config['input_w'])
         image_only_loader = torch.utils.data.DataLoader(image_only_ds, batch_size=4, shuffle=False, num_workers=2)
 
+        # DUNG HAN train_loader (co mask) cho CA vong lap Stage II khi dang
+        # thu nghiem early_stop_unsupervised - thay bang loader anh thuan
+        # tuy, batch_size=1 de tuong thich voi build_strong_augmentation
+        # (gia dinh batch=1, xem input.squeeze(0) trong sfuda_task_multiteacher)
+        stage2_train_ds = ImageOnlyDataset(
+            img_dir=os.path.join('inputs', args.target, 'train', 'images'),
+            img_ext=config['img_ext'], input_h=config['input_h'], input_w=config['input_w'])
+        stage2_train_loader = torch.utils.data.DataLoader(
+            stage2_train_ds, batch_size=1, shuffle=True, num_workers=config['num_workers'], drop_last=True)
+    else:
+        stage2_train_loader = train_loader
+
     actual_epochs_run = n_epochs
 
     for epoch in range(n_epochs):
         teacher_manager.set_progress(epoch / max(1, n_epochs - 1))
-        train_log = sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
-                                             tgt_optimizer, args.ensemble_mode, class_balance_tracker)
-        log_msg = 'epoch %d/%d - train_loss %.4f - train_iou %.4f' % (
-            epoch + 1, n_epochs, train_log['loss'], train_log['iou'])
+        train_log = sfuda_task_multiteacher(stage2_train_loader, teacher_manager, tgt_model, criterion,
+                                             tgt_optimizer, args.ensemble_mode, class_balance_tracker,
+                                             labels_available=(early_stopper is None))
+        log_msg = 'epoch %d/%d - train_loss %.4f' % (epoch + 1, n_epochs, train_log['loss'])
+        if 'iou' in train_log:
+            log_msg += ' - train_iou %.4f' % train_log['iou']
         if 'fg_weight' in train_log:
             log_msg += ' - fg_w %.3f - bg_w %.3f' % (train_log['fg_weight'], train_log['bg_weight'])
         print(log_msg)
 
-        # danh gia Dice MOI EPOCH - CHI DE THEO DOI/CHAN DOAN, KHONG duoc dung
-        # de quyet dinh dung som (se vi pham dieu kien unsupervised o dich).
-        # Viec DUNG SOM thuc su dung early_stopper (KHONG GIAM SAT) ben duoi.
-        tgt_model.eval()
-        epoch_val_log = validate(val_loader, tgt_model, criterion)
-        tgt_model.train()
-        print('  -> [Theo doi - CHI THAM KHAO, khong dung de quyet dinh] Dice sau epoch %d: %.4f' %
-              (epoch + 1, epoch_val_log['dice']))
+        # ==== THEO DOI DICE MOI EPOCH - CHI CHAY KHI KHONG bat early-stop ====
+        # Neu dang thu nghiem early_stop_unsupervised, KHOA HAN buoc nay -
+        # khong duoc phep cham vao val_loader (co label that) trong suot
+        # vong lap Stage II, du chi de "tham khao". Chi khi KHONG bat co
+        # che unsupervised (vd luc dieu tra hien tuong sup o stage2_epochs=20
+        # ban dau) moi cho phep theo doi Dice moi epoch de chan doan.
+        if not args.early_stop_unsupervised:
+            tgt_model.eval()
+            epoch_val_log = validate(val_loader, tgt_model, criterion)
+            tgt_model.train()
+            print('  -> [Theo doi - CHI THAM KHAO, khong dung de quyet dinh] Dice sau epoch %d: %.4f' %
+                  (epoch + 1, epoch_val_log['dice']))
 
         if early_stopper is not None:
             should_stop = early_stopper.check(tgt_model, image_only_loader, epoch + 1)
