@@ -49,6 +49,7 @@ from metrics import iou_score
 from utils import AverageMeter
 from multi_teacher import MultiTeacherManager
 from masked_loss import MaskedBCEDiceLoss
+from class_balance import ClassBalanceTracker, CalibratedBCEDiceLoss
 
 from tt_sfuda_2d import (
     build_strong_augmentation,
@@ -88,16 +89,24 @@ def parse_args():
                          help='Neu dat: CHI dung teacher "fast" (keep_rate=0.99), '
                               'tuong duong toan hoc voi baseline 1-teacher goc - '
                               'dung de so sanh cong bang qua CUNG 1 stage1_ckpt.')
+    parser.add_argument('--class_balance', action='store_true',
+                         help='Neu dat: bat Global Knowledge Guided Loss Calibration '
+                              '(CBMT, Tang et al. MICCAI 2023, Eq.5-6) - can chinh '
+                              'trong so nen/tien canh dua tren thong ke loss toan cuc. '
+                              'DOC LAP voi ensemble_mode/topology, co the cong don '
+                              'len bat ky cau hinh nao.')
     return parser.parse_args()
 
 
-def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion, optimizer, ensemble_mode):
+def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion, optimizer,
+                             ensemble_mode, class_balance_tracker=None):
     avg_meters = {'loss': AverageMeter(), 'iou': AverageMeter()}
     teacher_manager.train_mode(False)
     tgt_model.train()
     pbar = tqdm(total=len(train_loader))
     masked_criterion = MaskedBCEDiceLoss() if ensemble_mode == 'trust_region' else None
-    mean_trust_ratio = AverageMeter()  # theo doi % pixel duoc tin tuong, chi dung khi trust_region
+    calibrated_criterion = CalibratedBCEDiceLoss() if class_balance_tracker is not None else None
+    mean_trust_ratio = AverageMeter()
 
     for input, target, _ in train_loader:
         w_input = input.cuda()
@@ -117,10 +126,16 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
 
         optimizer.zero_grad()
         output, tgt_feat = tgt_model(s_input, mode='const')
+
         if ensemble_mode == 'trust_region':
             seg_loss = masked_criterion(output, ps_output, trust_mask)
+        elif class_balance_tracker is not None:
+            ratio = class_balance_tracker.get_ratio()
+            seg_loss = calibrated_criterion(output, ps_output, bg_weight_ratio=ratio)
+            class_balance_tracker.update(output.detach(), ps_output)
         else:
             seg_loss = criterion(output, ps_output)
+
         const_loss = consistency_loss(msrc_feat, tgt_feat)
         loss = seg_loss + const_loss
         loss.backward()
@@ -136,6 +151,8 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
         ])
         if ensemble_mode == 'trust_region':
             postfix['trust%'] = mean_trust_ratio.avg
+        if class_balance_tracker is not None:
+            postfix['bg_ratio'] = class_balance_tracker.get_ratio()
         pbar.set_postfix(postfix)
         pbar.update(1)
 
@@ -146,6 +163,8 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
                            ('iou', avg_meters['iou'].avg)])
     if ensemble_mode == 'trust_region':
         result['trust_ratio'] = mean_trust_ratio.avg
+    if class_balance_tracker is not None:
+        result['bg_ratio'] = class_balance_tracker.get_ratio()
     return result
 
 
@@ -274,12 +293,16 @@ def main():
 
     print("")
     print("Task specific adaptation (Stage II - Multi-EMA Teacher)...!!!")
+    class_balance_tracker = ClassBalanceTracker() if args.class_balance else None
     n_epochs = config['stage2']
     for epoch in range(n_epochs):
         teacher_manager.set_progress(epoch / max(1, n_epochs - 1))
         train_log = sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
-                                             tgt_optimizer, args.ensemble_mode)
-        print('train_loss %.4f - train_iou %.4f' % (train_log['loss'], train_log['iou']))
+                                             tgt_optimizer, args.ensemble_mode, class_balance_tracker)
+        log_msg = 'train_loss %.4f - train_iou %.4f' % (train_log['loss'], train_log['iou'])
+        if 'bg_ratio' in train_log:
+            log_msg += ' - bg_ratio %.4f' % train_log['bg_ratio']
+        print(log_msg)
 
     print("")
     print("Performing adapted target model evaluation...!!!")
@@ -302,6 +325,7 @@ def main():
         'topology': args.topology, 'ensemble_mode': args.ensemble_mode,
         'slow_keep_rate': args.slow_keep_rate, 'fast_weight': args.fast_weight,
         'single_teacher': args.single_teacher,
+        'class_balance': args.class_balance,
         'seed': args.seed, 'stage1_cached': args.stage1_ckpt is not None,
         'source_only_dice': source_only_dice,
         'adapted_dice': val_log['dice'],
