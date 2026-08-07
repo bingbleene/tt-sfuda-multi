@@ -51,6 +51,7 @@ from utils import AverageMeter
 from multi_teacher import MultiTeacherManager
 from masked_loss import MaskedBCEDiceLoss
 from class_balance import ClassBalanceTracker, CalibratedBCEDiceLoss
+from unsupervised_early_stop import UnsupervisedEarlyStopper, ImageOnlyDataset
 
 from tt_sfuda_2d import (
     build_strong_augmentation,
@@ -104,6 +105,14 @@ def parse_args():
                               '(vd config goc chi co 5, thu keo dai len 10-15-20 '
                               'xem Dual-EMA + class-balance co du on dinh de train '
                               'lau hon khong bi suy thoai hay khong)')
+    parser.add_argument('--early_stop_unsupervised', action='store_true',
+                         help='Bat early-stopping KHONG GIAM SAT (khong dung label '
+                              'dich) - dua tren do troi ty le pixel du doan duong '
+                              'tinh. Dung KET HOP voi --stage2_epochs de dat SO '
+                              'EPOCH LON, roi de co che nay tu dung dung som neu '
+                              'phat hien bat on.')
+    parser.add_argument('--early_stop_patience', type=int, default=3)
+    parser.add_argument('--early_stop_threshold', type=float, default=0.20)
     return parser.parse_args()
 
 
@@ -313,6 +322,22 @@ def main():
     n_epochs = args.stage2_epochs if args.stage2_epochs is not None else config['stage2']
     print(f"[INFO] Stage II se chay {n_epochs} epoch "
           f"({'ghi de tu --stage2_epochs' if args.stage2_epochs is not None else 'tu config goc'})")
+
+    early_stopper = UnsupervisedEarlyStopper(
+        patience=args.early_stop_patience,
+        ratio_change_threshold=args.early_stop_threshold) if args.early_stop_unsupervised else None
+
+    image_only_loader = None
+    if early_stopper is not None:
+        # loader RIENG, khong di qua dataset.Dataset goc (von co doc mask) -
+        # ve mat cau truc KHONG THE nao lo label vao co che early-stop
+        image_only_ds = ImageOnlyDataset(
+            img_dir=os.path.join('inputs', args.target, 'train', 'images'),
+            img_ext=config['img_ext'], input_h=config['input_h'], input_w=config['input_w'])
+        image_only_loader = torch.utils.data.DataLoader(image_only_ds, batch_size=4, shuffle=False, num_workers=2)
+
+    actual_epochs_run = n_epochs
+
     for epoch in range(n_epochs):
         teacher_manager.set_progress(epoch / max(1, n_epochs - 1))
         train_log = sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
@@ -323,13 +348,23 @@ def main():
             log_msg += ' - fg_w %.3f - bg_w %.3f' % (train_log['fg_weight'], train_log['bg_weight'])
         print(log_msg)
 
-        # danh gia Dice MOI EPOCH (khong chi epoch cuoi) - de biet chinh xac
-        # model co bat dau suy thoai o dau khong khi keo dai training, giong
-        # cach CBMT (Fig.2b) tu ve duong cong huan luyen de chung minh on dinh
+        # danh gia Dice MOI EPOCH - CHI DE THEO DOI/CHAN DOAN, KHONG duoc dung
+        # de quyet dinh dung som (se vi pham dieu kien unsupervised o dich).
+        # Viec DUNG SOM thuc su dung early_stopper (KHONG GIAM SAT) ben duoi.
         tgt_model.eval()
         epoch_val_log = validate(val_loader, tgt_model, criterion)
         tgt_model.train()
-        print('  -> [Theo doi] Dice sau epoch %d: %.4f' % (epoch + 1, epoch_val_log['dice']))
+        print('  -> [Theo doi - CHI THAM KHAO, khong dung de quyet dinh] Dice sau epoch %d: %.4f' %
+              (epoch + 1, epoch_val_log['dice']))
+
+        if early_stopper is not None:
+            should_stop = early_stopper.check(tgt_model, image_only_loader, epoch + 1)
+            if should_stop:
+                actual_epochs_run = epoch + 1
+                restored_epoch = early_stopper.restore_best(tgt_model)
+                print(f"[EarlyStop-KGS] DUNG SOM tai epoch {epoch+1} (phat hien bat on lien tiep). "
+                      f"Quay ve checkpoint epoch {restored_epoch}.")
+                break
 
     print("")
     print("Performing adapted target model evaluation...!!!")
@@ -361,6 +396,8 @@ def main():
         'source_only_dice': source_only_dice,
         'adapted_dice': val_log['dice'],
         'duration_sec': round(duration_sec, 1),
+        'stage2_epochs_planned': n_epochs,
+        'stage2_epochs_actual': actual_epochs_run,
     }
     write_header = not os.path.exists(args.results_csv)
     with open(args.results_csv, 'a') as f:
