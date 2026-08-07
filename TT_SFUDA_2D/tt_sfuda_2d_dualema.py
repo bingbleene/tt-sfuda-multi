@@ -1,31 +1,39 @@
 """
-tt_sfuda_2d_dualema.py (v2)
-============================
-Them 2 tham so CLI so voi ban v1, de sweep nhanh khong can sua file:
-  --ensemble_mode {mean, weighted, confidence}  (chi anh huong topology=parallel)
-  --slow_keep_rate <float>   (ghi de keep_rate cua teacher 'slow' trong yaml,
-                               vd de sweep 0.993/0.995/0.997/0.999)
-  --fast_weight <float>      (dung khi ensemble_mode='weighted', trong so cua
-                               teacher 'fast'; trong so 'slow' = 1 - fast_weight)
+tt_sfuda_2d_dualema.py (v3)
+=============================
+So voi v2, them 2 co che quan trong de KET QUA CO THE SO SANH DUOC giua
+cac lan chay (khong con bi nhieu RNG lam sai lech ket luan):
 
-Cach chay (vi du sweep nhanh keep_rate cho cascaded/parallel):
-    python run.py tt_sfuda_2d_dualema.py --source chase_unet --target rite \
-        --topology parallel --ensemble_mode confidence
+  1. --seed <int> (mac dinh 42) - co dinh torch/numpy/random seed TRUOC
+     Stage I va Stage II, giam nhieu tu augmentation/shuffle.
 
-    python run.py tt_sfuda_2d_dualema.py --source chase_unet --target rite \
-        --topology parallel --ensemble_mode weighted --fast_weight 0.8
+  2. --stage1_ckpt <path> - NEU file da ton tai, BO QUA train lai Stage I,
+     load thang checkpoint co san va di thang vao Stage II. NEU chua ton
+     tai, train Stage I nhu binh thuong ROI LUU LAI vao duong dan nay, de
+     lan sau (voi topology/keep_rate khac) tai su dung - dam bao MOI THU
+     NGHIEM STAGE II XUAT PHAT TU CUNG 1 DIEM, chi khac nhau o phan dang
+     thuc su muon so sanh (Stage II).
 
+Cach dung (khuyen nghi TU GIO VE SAU thay vi goi truc tiep nhu v2):
+    # Lan dau tien cho 1 domain shift - se train Stage I va luu lai
     python run.py tt_sfuda_2d_dualema.py --source chase_unet --target rite \
-        --topology cascaded --slow_keep_rate 0.995
+        --topology parallel --slow_keep_rate 0.995 \
+        --stage1_ckpt cache/chase_to_rite_stage1.pth
+
+    # Cac lan sau, CUNG domain shift, khac topology/keep_rate - TAI SU DUNG
+    # checkpoint Stage I, khong train lai, loai bo nhieu:
+    python run.py tt_sfuda_2d_dualema.py --source chase_unet --target rite \
+        --topology cascaded --stage1_ckpt cache/chase_to_rite_stage1.pth
 """
 import os
-import json
+import random
 import yaml
 import argparse
 from glob import glob
 from tqdm import tqdm
 from collections import OrderedDict
 
+import numpy as np
 from albumentations import RandomRotate90, Resize
 from albumentations.augmentations import transforms
 from albumentations.core.composition import Compose
@@ -51,18 +59,29 @@ from tt_sfuda_2d import (
 cudnn.benchmark = True
 
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # luu y: cudnn.benchmark=True (o tren) co the van gay nhieu do chon
+    # thuat toan nhanh nhat tuy phan cung - chap nhan duoc, day la nguon
+    # nhieu con lai nho hon nhieu so voi RNG cua augmentation/shuffle.
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', default=None)
     parser.add_argument('--target', default=None)
     parser.add_argument('--topology', default='parallel', choices=['parallel', 'cascaded'])
     parser.add_argument('--ensemble_mode', default='mean', choices=['mean', 'weighted', 'confidence'])
-    parser.add_argument('--slow_keep_rate', type=float, default=None,
-                         help='Neu dat, ghi de keep_rate cua teacher "slow" tu yaml')
-    parser.add_argument('--fast_weight', type=float, default=None,
-                         help='Neu dat, ghi de weight cua teacher "fast" (dung voi ensemble_mode=weighted)')
-    parser.add_argument('--results_csv', default='results_dualema.csv',
-                         help='File CSV de append ket qua, phuc vu sweep nhieu lan')
+    parser.add_argument('--slow_keep_rate', type=float, default=None)
+    parser.add_argument('--fast_weight', type=float, default=None)
+    parser.add_argument('--results_csv', default='results_dualema.csv')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--stage1_ckpt', default=None,
+                         help='Neu dat: cache/tai su dung checkpoint Stage I, '
+                              'dam bao moi thu nghiem Stage II xuat phat cung 1 diem.')
     return parser.parse_args()
 
 
@@ -112,12 +131,12 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
 
     config_file = "config_" + args.target + "_dualema"
     with open('models/%s/%s.yml' % (args.source, config_file), 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
 
-    # ---- ghi de teacher config qua CLI, khong can sua yaml moi lan sweep ----
     teachers = config['teachers']
     if args.slow_keep_rate is not None:
         for t in teachers:
@@ -185,26 +204,38 @@ def main():
     tgt_params = filter(lambda p: p.requires_grad, tgt_model.parameters())
     tgt_optimizer = optim.Adam(tgt_params, lr=config['lr'], weight_decay=config['weight_decay'])
 
-    pseudo_model = archs.__dict__[config['arch']](config['num_classes'],
-                                                   config['input_channels'],
-                                                   config['deep_supervision'])
-    pseudo_model.load_state_dict(msrc_model.state_dict())
-    pseudo_model.cuda()
-    pseudo_model.eval()
-
     criterion = losses.__dict__[config['loss']]().cuda()
 
     print("")
     print("Performing source only model evaluation...!!!")
     val_log = validate(val_loader, msrc_model, criterion)
-    source_only_dice = val_log['dice']   # luu rieng - val_log se bi ghi de sau khi adapt xong
+    source_only_dice = val_log['dice']
     print('Source_only dice: %.4f' % (source_only_dice))
 
-    print("")
-    print("Target specific adaptation (Stage I - giong het baseline)...!!!")
-    for epoch in range(config['stage1']):
-        train_log = sfuda_target(config, train_loader, pseudo_model, msrc_model, criterion, src_optimizer)
-        print('train_loss %.4f - train_iou %.4f' % (train_log['loss'], train_log['iou']))
+    # ================== DIEM KHAC BIET CHINH so voi v2 ==================
+    if args.stage1_ckpt is not None and os.path.exists(args.stage1_ckpt):
+        print("")
+        print(f"[CACHE] Tai checkpoint Stage I co san tu {args.stage1_ckpt} - BO QUA train lai.")
+        msrc_model.load_state_dict(torch.load(args.stage1_ckpt))
+    else:
+        pseudo_model = archs.__dict__[config['arch']](config['num_classes'],
+                                                       config['input_channels'],
+                                                       config['deep_supervision'])
+        pseudo_model.load_state_dict(msrc_model.state_dict())
+        pseudo_model.cuda()
+        pseudo_model.eval()
+
+        print("")
+        print("Target specific adaptation (Stage I)...!!!")
+        for epoch in range(config['stage1']):
+            train_log = sfuda_target(config, train_loader, pseudo_model, msrc_model, criterion, src_optimizer)
+            print('train_loss %.4f - train_iou %.4f' % (train_log['loss'], train_log['iou']))
+
+        if args.stage1_ckpt is not None:
+            os.makedirs(os.path.dirname(args.stage1_ckpt) or '.', exist_ok=True)
+            torch.save(msrc_model.state_dict(), args.stage1_ckpt)
+            print(f"[CACHE] Da luu checkpoint Stage I vao {args.stage1_ckpt} de tai su dung sau nay.")
+    # ======================================================================
 
     msrc_model.eval()
     tgt_model.load_state_dict(msrc_model.state_dict())
@@ -241,11 +272,11 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     torch.save(tgt_model.state_dict(), os.path.join(out_dir, 'model.pth'))
 
-    # ---- ghi ket qua vao CSV de tien tong hop, khong ghi de - append ----
     row = {
         'source': args.source, 'target': args.target,
         'topology': args.topology, 'ensemble_mode': args.ensemble_mode,
         'slow_keep_rate': args.slow_keep_rate, 'fast_weight': args.fast_weight,
+        'seed': args.seed, 'stage1_cached': args.stage1_ckpt is not None,
         'source_only_dice': source_only_dice,
         'adapted_dice': val_log['dice'],
     }

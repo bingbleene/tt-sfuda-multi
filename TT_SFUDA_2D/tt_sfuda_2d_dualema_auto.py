@@ -119,6 +119,7 @@ def main():
            '--topology', decision['topology'],
            '--ensemble_mode', decision['ensemble_mode'],
            '--slow_keep_rate', str(decision['slow_keep_rate']),
+           '--stage1_ckpt', f'cache/{args.source}_to_{args.target}_stage1.pth',
            '--results_csv', args.results_csv]
     print(f"[AUTO] Chay: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
