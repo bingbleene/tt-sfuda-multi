@@ -29,6 +29,7 @@ import os
 import random
 import yaml
 import argparse
+from datetime import datetime
 from glob import glob
 from tqdm import tqdm
 from collections import OrderedDict
@@ -90,11 +91,14 @@ def parse_args():
                               'tuong duong toan hoc voi baseline 1-teacher goc - '
                               'dung de so sanh cong bang qua CUNG 1 stage1_ckpt.')
     parser.add_argument('--class_balance', action='store_true',
-                         help='Neu dat: bat Global Knowledge Guided Loss Calibration '
-                              '(CBMT, Tang et al. MICCAI 2023, Eq.5-6) - can chinh '
-                              'trong so nen/tien canh dua tren thong ke loss toan cuc. '
-                              'DOC LAP voi ensemble_mode/topology, co the cong don '
-                              'len bat ky cau hinh nao.')
+                         help='Neu dat: bat class-balance loss calibration (xem class_balance.py).')
+    parser.add_argument('--class_balance_strategy', default='symmetric',
+                         choices=['cbmt', 'symmetric', 'fixed_fg'],
+                         help='cbmt=cong thuc goc CBMT (chi giam bg); '
+                              'symmetric=ben nao kho hon duoc tang trong so; '
+                              'fixed_fg=tang co dinh trong so tien canh, khong can theo doi dong')
+    parser.add_argument('--fixed_fg_weight', type=float, default=2.0,
+                         help='Chi dung khi class_balance_strategy=fixed_fg')
     return parser.parse_args()
 
 
@@ -130,8 +134,8 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
         if ensemble_mode == 'trust_region':
             seg_loss = masked_criterion(output, ps_output, trust_mask)
         elif class_balance_tracker is not None:
-            ratio = class_balance_tracker.get_ratio()
-            seg_loss = calibrated_criterion(output, ps_output, bg_weight_ratio=ratio)
+            fg_w, bg_w = class_balance_tracker.get_weights()
+            seg_loss = calibrated_criterion(output, ps_output, fg_weight=fg_w, bg_weight=bg_w)
             class_balance_tracker.update(output.detach(), ps_output)
         else:
             seg_loss = criterion(output, ps_output)
@@ -152,7 +156,9 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
         if ensemble_mode == 'trust_region':
             postfix['trust%'] = mean_trust_ratio.avg
         if class_balance_tracker is not None:
-            postfix['bg_ratio'] = class_balance_tracker.get_ratio()
+            fg_w, bg_w = class_balance_tracker.get_weights()
+            postfix['fg_w'] = fg_w
+            postfix['bg_w'] = bg_w
         pbar.set_postfix(postfix)
         pbar.update(1)
 
@@ -164,11 +170,14 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
     if ensemble_mode == 'trust_region':
         result['trust_ratio'] = mean_trust_ratio.avg
     if class_balance_tracker is not None:
-        result['bg_ratio'] = class_balance_tracker.get_ratio()
+        fg_w, bg_w = class_balance_tracker.get_weights()
+        result['fg_weight'] = fg_w
+        result['bg_weight'] = bg_w
     return result
 
 
 def main():
+    run_start_time = datetime.now()
     args = parse_args()
     set_seed(args.seed)
 
@@ -293,15 +302,17 @@ def main():
 
     print("")
     print("Task specific adaptation (Stage II - Multi-EMA Teacher)...!!!")
-    class_balance_tracker = ClassBalanceTracker() if args.class_balance else None
+    class_balance_tracker = ClassBalanceTracker(
+        strategy=args.class_balance_strategy,
+        fixed_fg_weight=args.fixed_fg_weight) if args.class_balance else None
     n_epochs = config['stage2']
     for epoch in range(n_epochs):
         teacher_manager.set_progress(epoch / max(1, n_epochs - 1))
         train_log = sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
                                              tgt_optimizer, args.ensemble_mode, class_balance_tracker)
         log_msg = 'train_loss %.4f - train_iou %.4f' % (train_log['loss'], train_log['iou'])
-        if 'bg_ratio' in train_log:
-            log_msg += ' - bg_ratio %.4f' % train_log['bg_ratio']
+        if 'fg_weight' in train_log:
+            log_msg += ' - fg_w %.3f - bg_w %.3f' % (train_log['fg_weight'], train_log['bg_weight'])
         print(log_msg)
 
     print("")
@@ -309,6 +320,8 @@ def main():
     val_log = validate(val_loader, tgt_model, criterion)
     print('Adapted target model (multi-teacher, %s, %s) dice: %.4f' %
           (args.topology, args.ensemble_mode, val_log['dice']))
+
+    duration_sec = (datetime.now() - run_start_time).total_seconds()
 
     tag = f"{args.topology}_{args.ensemble_mode}"
     if args.slow_keep_rate is not None:
@@ -321,14 +334,17 @@ def main():
     torch.save(tgt_model.state_dict(), os.path.join(out_dir, 'model.pth'))
 
     row = {
+        'timestamp': run_start_time.strftime('%Y-%m-%d %H:%M:%S'),
         'source': args.source, 'target': args.target,
         'topology': args.topology, 'ensemble_mode': args.ensemble_mode,
         'slow_keep_rate': args.slow_keep_rate, 'fast_weight': args.fast_weight,
         'single_teacher': args.single_teacher,
         'class_balance': args.class_balance,
+        'class_balance_strategy': args.class_balance_strategy if args.class_balance else None,
         'seed': args.seed, 'stage1_cached': args.stage1_ckpt is not None,
         'source_only_dice': source_only_dice,
         'adapted_dice': val_log['dice'],
+        'duration_sec': round(duration_sec, 1),
     }
     write_header = not os.path.exists(args.results_csv)
     with open(args.results_csv, 'a') as f:
