@@ -48,6 +48,7 @@ from dataset import Dataset
 from metrics import iou_score
 from utils import AverageMeter
 from multi_teacher import MultiTeacherManager
+from masked_loss import MaskedBCEDiceLoss
 
 from tt_sfuda_2d import (
     build_strong_augmentation,
@@ -74,7 +75,8 @@ def parse_args():
     parser.add_argument('--source', default=None)
     parser.add_argument('--target', default=None)
     parser.add_argument('--topology', default='parallel', choices=['parallel', 'cascaded'])
-    parser.add_argument('--ensemble_mode', default='mean', choices=['mean', 'weighted', 'confidence'])
+    parser.add_argument('--ensemble_mode', default='mean',
+                         choices=['mean', 'weighted', 'confidence', 'warmup', 'trust_region'])
     parser.add_argument('--slow_keep_rate', type=float, default=None)
     parser.add_argument('--fast_weight', type=float, default=None)
     parser.add_argument('--results_csv', default='results_dualema.csv')
@@ -94,6 +96,8 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
     teacher_manager.train_mode(False)
     tgt_model.train()
     pbar = tqdm(total=len(train_loader))
+    masked_criterion = MaskedBCEDiceLoss() if ensemble_mode == 'trust_region' else None
+    mean_trust_ratio = AverageMeter()  # theo doi % pixel duoc tin tuong, chi dung khi trust_region
 
     for input, target, _ in train_loader:
         w_input = input.cuda()
@@ -102,14 +106,21 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
         s_input = image_strong_aug.unsqueeze(0).cuda()
 
         with torch.no_grad():
-            w_output, msrc_feat = teacher_manager.predict(w_input, mode='const', ensemble_mode=ensemble_mode)
-            ps_output = w_output.detach().clone()
-            ps_output[ps_output >= 0.5] = 1
-            ps_output[ps_output < 0.5] = 0
+            if ensemble_mode == 'trust_region':
+                ps_output, trust_mask, msrc_feat = teacher_manager.predict_with_trust(w_input, mode='const')
+                mean_trust_ratio.update(trust_mask.mean().item(), input.size(0))
+            else:
+                w_output, msrc_feat = teacher_manager.predict(w_input, mode='const', ensemble_mode=ensemble_mode)
+                ps_output = w_output.detach().clone()
+                ps_output[ps_output >= 0.5] = 1
+                ps_output[ps_output < 0.5] = 0
 
         optimizer.zero_grad()
         output, tgt_feat = tgt_model(s_input, mode='const')
-        seg_loss = criterion(output, ps_output)
+        if ensemble_mode == 'trust_region':
+            seg_loss = masked_criterion(output, ps_output, trust_mask)
+        else:
+            seg_loss = criterion(output, ps_output)
         const_loss = consistency_loss(msrc_feat, tgt_feat)
         loss = seg_loss + const_loss
         loss.backward()
@@ -123,14 +134,19 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
             ('loss', avg_meters['loss'].avg),
             ('iou', avg_meters['iou'].avg),
         ])
+        if ensemble_mode == 'trust_region':
+            postfix['trust%'] = mean_trust_ratio.avg
         pbar.set_postfix(postfix)
         pbar.update(1)
 
         teacher_manager.update(tgt_model)
 
     pbar.close()
-    return OrderedDict([('loss', avg_meters['loss'].avg),
-                         ('iou', avg_meters['iou'].avg)])
+    result = OrderedDict([('loss', avg_meters['loss'].avg),
+                           ('iou', avg_meters['iou'].avg)])
+    if ensemble_mode == 'trust_region':
+        result['trust_ratio'] = mean_trust_ratio.avg
+    return result
 
 
 def main():
@@ -258,7 +274,9 @@ def main():
 
     print("")
     print("Task specific adaptation (Stage II - Multi-EMA Teacher)...!!!")
-    for epoch in range(config['stage2']):
+    n_epochs = config['stage2']
+    for epoch in range(n_epochs):
+        teacher_manager.set_progress(epoch / max(1, n_epochs - 1))
         train_log = sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
                                              tgt_optimizer, args.ensemble_mode)
         print('train_loss %.4f - train_iou %.4f' % (train_log['loss'], train_log['iou']))
@@ -283,6 +301,7 @@ def main():
         'source': args.source, 'target': args.target,
         'topology': args.topology, 'ensemble_mode': args.ensemble_mode,
         'slow_keep_rate': args.slow_keep_rate, 'fast_weight': args.fast_weight,
+        'single_teacher': args.single_teacher,
         'seed': args.seed, 'stage1_cached': args.stage1_ckpt is not None,
         'source_only_dice': source_only_dice,
         'adapted_dice': val_log['dice'],

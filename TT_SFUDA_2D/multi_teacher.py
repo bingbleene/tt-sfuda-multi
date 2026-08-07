@@ -41,6 +41,15 @@ class MultiTeacherManager:
         self.keep_rates = {c['name']: c['keep_rate'] for c in teacher_configs}
         self.static_weights = {c['name']: c.get('weight', 1.0) for c in teacher_configs}
         self.teachers = {}
+        self._progress = 1.0   # dung cho ensemble_mode='warmup', xem set_progress()
+
+    def set_progress(self, progress):
+        """
+        progress trong [0,1] - ty le epoch da hoan thanh trong Stage II.
+        CHI anh huong ensemble_mode='warmup'. Goi 1 lan moi epoch (khong
+        phai moi iteration) tu vong lap huan luyen ben ngoai.
+        """
+        self._progress = max(0.0, min(1.0, progress))
 
     def init_from(self, base_model):
         base_state = base_model.state_dict()
@@ -92,7 +101,7 @@ class MultiTeacherManager:
             return torch.sigmoid(out)
 
         # ==== topology == 'parallel' ====
-        assert ensemble_mode in ('mean', 'weighted', 'confidence'), \
+        assert ensemble_mode in ('mean', 'weighted', 'confidence', 'warmup', 'trust_region'), \
             f"ensemble_mode khong hop le: {ensemble_mode}"
 
         outs = {}   # name -> prob
@@ -111,6 +120,27 @@ class MultiTeacherManager:
         elif ensemble_mode == 'weighted':
             total = sum(self.static_weights[name] for name in self.order)
             weights = {name: self.static_weights[name] / total for name in self.order}
+
+        elif ensemble_mode == 'warmup':
+            # Chi ho tro dung 2 teacher ten 'fast'/'slow'. Trong so 'slow'
+            # TANG DAN theo tien do Stage II (self._progress, cap nhat moi
+            # epoch qua set_progress()): dau Stage II gan nhu chi nghe
+            # 'fast' (giong baseline, tu do thich nghi), cuoi Stage II moi
+            # nghe 'slow' theo dung ty le dich (static_weights['slow']).
+            # Muc dich: tranh teacher 'slow' "neo" vao checkpoint Stage I
+            # con kem ngay tu dau (nguyen nhan da chan doan gay hai o RITE).
+            assert set(self.order) == {'fast', 'slow'}, \
+                "ensemble_mode='warmup' chi ho tro dung 2 teacher ten 'fast' va 'slow'"
+            total_w = self.static_weights['fast'] + self.static_weights['slow']
+            target_slow_w = self.static_weights['slow'] / total_w  # vd 1.0/1.0 -> 0.5 (mac dinh)
+            slow_w = self._progress * target_slow_w
+            weights = {'fast': 1.0 - slow_w, 'slow': slow_w}
+
+        elif ensemble_mode == 'trust_region':
+            raise ValueError(
+                "ensemble_mode='trust_region' phai goi qua predict_with_trust(), "
+                "khong phai predict() - vi can tra ve them trust_mask."
+            )
 
         else:  # 'confidence' - trong so DONG theo tung pixel, dua tren entropy
             eps = 1e-6
@@ -132,10 +162,46 @@ class MultiTeacherManager:
             return avg_prob, avg_feats
         return avg_prob
 
+    @torch.no_grad()
+    def predict_with_trust(self, input_tensor, agree_threshold=0.5, mode='const'):
+        """
+        'trust_region': KHONG gop 2 xac suat thanh 1 con so trung gian. Thay
+        vao do:
+          - agree_mask = 1 o nhung pixel ca 'fast' va 'slow' CUNG dong y ve
+            nhan nhi phan (ca hai >=0.5 hoac ca hai <0.5), 0 o nhung pixel
+            bat dong.
+          - pseudo_label lay tu 'fast' (thich nghi nhanh hon, uu tien khi
+            CA HAI DA DONG Y - luc do dung ai cung nhu nhau).
+          - O vung bat dong, KHONG ep student hoc theo ben nao ca (mask=0
+            -> loai khoi loss hoan toan), thay vi thoa hiep (trung binh)
+            nhu cac ensemble_mode khac - day la diem khac biet cot loi.
+
+        Chi ho tro dung 2 teacher 'fast'/'slow', topology='parallel'.
+        Tra ve: (pseudo_label, trust_mask, feats)
+        """
+        assert self.topology == 'parallel', "trust_region chi ho tro topology='parallel'"
+        assert set(self.order) == {'fast', 'slow'}, \
+            "trust_region chi ho tro dung 2 teacher ten 'fast' va 'slow'"
+
+        out_fast, feats_fast = self.teachers['fast'](input_tensor, mode='const')
+        out_slow, feats_slow = self.teachers['slow'](input_tensor, mode='const')
+        prob_fast = torch.sigmoid(out_fast)
+        prob_slow = torch.sigmoid(out_slow)
+
+        label_fast = (prob_fast >= agree_threshold).float()
+        label_slow = (prob_slow >= agree_threshold).float()
+        trust_mask = (label_fast == label_slow).float()
+
+        pseudo_label = label_fast  # o vung dong y, label_fast == label_slow, chon ben nao cung nhu nhau
+
+        n_layers = len(feats_fast)
+        avg_feats = [(feats_fast[i] + feats_slow[i]) / 2 for i in range(n_layers)]
+
+        return pseudo_label, trust_mask, avg_feats
+
     def train_mode(self, flag=False):
         for m in self.teachers.values():
             m.train(flag)
-
     def cuda(self):
         for m in self.teachers.values():
             m.cuda()
