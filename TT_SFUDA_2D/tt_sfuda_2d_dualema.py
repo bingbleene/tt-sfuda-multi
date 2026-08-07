@@ -99,6 +99,11 @@ def parse_args():
                               'fixed_fg=tang co dinh trong so tien canh, khong can theo doi dong')
     parser.add_argument('--fixed_fg_weight', type=float, default=2.0,
                          help='Chi dung khi class_balance_strategy=fixed_fg')
+    parser.add_argument('--stage2_epochs', type=int, default=None,
+                         help='Neu dat: GHI DE so epoch Stage II tu config goc '
+                              '(vd config goc chi co 5, thu keo dai len 10-15-20 '
+                              'xem Dual-EMA + class-balance co du on dinh de train '
+                              'lau hon khong bi suy thoai hay khong)')
     return parser.parse_args()
 
 
@@ -305,15 +310,26 @@ def main():
     class_balance_tracker = ClassBalanceTracker(
         strategy=args.class_balance_strategy,
         fixed_fg_weight=args.fixed_fg_weight) if args.class_balance else None
-    n_epochs = config['stage2']
+    n_epochs = args.stage2_epochs if args.stage2_epochs is not None else config['stage2']
+    print(f"[INFO] Stage II se chay {n_epochs} epoch "
+          f"({'ghi de tu --stage2_epochs' if args.stage2_epochs is not None else 'tu config goc'})")
     for epoch in range(n_epochs):
         teacher_manager.set_progress(epoch / max(1, n_epochs - 1))
         train_log = sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
                                              tgt_optimizer, args.ensemble_mode, class_balance_tracker)
-        log_msg = 'train_loss %.4f - train_iou %.4f' % (train_log['loss'], train_log['iou'])
+        log_msg = 'epoch %d/%d - train_loss %.4f - train_iou %.4f' % (
+            epoch + 1, n_epochs, train_log['loss'], train_log['iou'])
         if 'fg_weight' in train_log:
             log_msg += ' - fg_w %.3f - bg_w %.3f' % (train_log['fg_weight'], train_log['bg_weight'])
         print(log_msg)
+
+        # danh gia Dice MOI EPOCH (khong chi epoch cuoi) - de biet chinh xac
+        # model co bat dau suy thoai o dau khong khi keo dai training, giong
+        # cach CBMT (Fig.2b) tu ve duong cong huan luyen de chung minh on dinh
+        tgt_model.eval()
+        epoch_val_log = validate(val_loader, tgt_model, criterion)
+        tgt_model.train()
+        print('  -> [Theo doi] Dice sau epoch %d: %.4f' % (epoch + 1, epoch_val_log['dice']))
 
     print("")
     print("Performing adapted target model evaluation...!!!")
