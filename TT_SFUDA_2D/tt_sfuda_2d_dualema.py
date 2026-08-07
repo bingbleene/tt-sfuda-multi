@@ -82,6 +82,10 @@ def parse_args():
     parser.add_argument('--stage1_ckpt', default=None,
                          help='Neu dat: cache/tai su dung checkpoint Stage I, '
                               'dam bao moi thu nghiem Stage II xuat phat cung 1 diem.')
+    parser.add_argument('--single_teacher', action='store_true',
+                         help='Neu dat: CHI dung teacher "fast" (keep_rate=0.99), '
+                              'tuong duong toan hoc voi baseline 1-teacher goc - '
+                              'dung de so sanh cong bang qua CUNG 1 stage1_ckpt.')
     return parser.parse_args()
 
 
@@ -138,6 +142,9 @@ def main():
         config = yaml.load(f, Loader=yaml.FullLoader)
 
     teachers = config['teachers']
+    if args.single_teacher:
+        teachers = [t for t in teachers if t['name'] == 'fast']
+        assert len(teachers) == 1, "Khong tim thay teacher 'fast' trong config"
     if args.slow_keep_rate is not None:
         for t in teachers:
             if t['name'] == 'slow':
