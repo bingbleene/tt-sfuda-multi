@@ -39,10 +39,13 @@ import torch.nn.functional as F
 
 
 class ClassBalanceTracker:
-    def __init__(self, momentum=0.9, prob_low=0.05, prob_high=0.95):
+    def __init__(self, momentum=0.9, prob_low=0.05, prob_high=0.95,
+                 ratio_min=0.1, ratio_max=10.0):
         self.momentum = momentum
         self.prob_low = prob_low
         self.prob_high = prob_high
+        self.ratio_min = ratio_min   # CHAN AN TOAN - tranh bg_ratio no lon lam mat on dinh
+        self.ratio_max = ratio_max   # gay NaN qua vai vong feedback (loss lon -> gradient lon -> logits no)
         self.eta_fg = None
         self.eta_bg = None
 
@@ -52,6 +55,13 @@ class ClassBalanceTracker:
         cho het epoch) - cap nhat eta_fg/eta_bg qua EMA."""
         prob = torch.sigmoid(output_logits)
         per_pixel_bce = F.binary_cross_entropy_with_logits(output_logits, pseudo_label, reduction='none')
+
+        # bao ve: neu output_logits da co NaN/Inf (vi du do buoc truoc do da
+        # mat on dinh), BO QUA cap nhat lan nay - tranh lan truyen NaN vao
+        # eta_fg/eta_bg (moi khi da nhiem NaN, EMA se giu NaN MAI MAI vi
+        # moi phep toan voi NaN deu ra NaN).
+        if not torch.isfinite(per_pixel_bce).all():
+            return
 
         informative = ((prob > self.prob_low) & (prob < self.prob_high)).float()
         fg_mask = pseudo_label * informative
@@ -72,11 +82,16 @@ class ClassBalanceTracker:
             self.eta_bg = self.momentum * self.eta_bg + (1 - self.momentum) * batch_eta_bg
 
     def get_ratio(self, eps=1e-6):
-        """Ty le eta_fg/eta_bg dung de can chinh trong so nen (Eq.6).
-        Tra ve 1.0 (khong can chinh gi) neu chua co du lieu."""
+        """Ty le eta_fg/eta_bg dung de can chinh trong so nen (Eq.6), DA
+        CHAN trong [ratio_min, ratio_max] de tranh mat on dinh so hoc.
+        Tra ve 1.0 (khong can chinh gi) neu chua co du lieu hoac gia tri
+        khong hop le (NaN/Inf)."""
         if self.eta_fg is None or self.eta_bg is None:
             return 1.0
-        return self.eta_fg / (self.eta_bg + eps)
+        ratio = self.eta_fg / (self.eta_bg + eps)
+        if not (ratio == ratio) or ratio in (float('inf'), float('-inf')):  # kiem tra NaN/Inf khong can import math
+            return 1.0
+        return max(self.ratio_min, min(self.ratio_max, ratio))
 
 
 class CalibratedBCEDiceLoss(nn.Module):
@@ -89,8 +104,13 @@ class CalibratedBCEDiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, output_logits, target, bg_weight_ratio=1.0):
+        # chan an toan lan 2 (du ClassBalanceTracker da chan) - phong khi
+        # ham nay duoc goi truc tiep voi ratio tu nguon khac khong qua tracker
+        bg_weight_ratio = max(0.01, min(100.0, bg_weight_ratio))
+
         prob = torch.sigmoid(output_logits)
-        eps = 1e-8
+        eps = 1e-6   # PHAI >= ~1e-6 de khong bi lam tron mat trong float32 gan 1.0
+                     # (1 - 1e-8 lam tron thanh dung 1.0 trong float32 -> log(0) = -inf)
         prob_c = prob.clamp(eps, 1 - eps)
 
         fg_term = target * torch.log(prob_c)
@@ -100,4 +120,12 @@ class CalibratedBCEDiceLoss(nn.Module):
         intersection = (prob * target).sum()
         dice = 1 - (2 * intersection + self.smooth) / (prob.sum() + target.sum() + self.smooth)
 
-        return 0.5 * bce_calibrated + dice
+        loss = 0.5 * bce_calibrated + dice
+        if not torch.isfinite(loss):
+            # phong ho cuoi cung: neu van ra NaN/Inf vi ly do khac, tra ve
+            # loss KHONG can chinh (ratio=1.0) thay vi lam sap ca qua trinh train
+            fg_term = target * torch.log(prob_c)
+            bg_term = (1 - target) * torch.log(1 - prob_c)
+            bce_fallback = -(fg_term + bg_term).mean()
+            loss = 0.5 * bce_fallback + dice
+        return loss
