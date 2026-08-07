@@ -1,37 +1,31 @@
 """
-class_balance.py
-==================
-Cai bien tu ky thuat "Global Knowledge Guided Loss Calibration" trong CBMT
-(Tang et al., Source-Free Domain Adaptive Fundus Image Segmentation with
-Class-Balanced Mean Teacher, MICCAI 2023, arXiv:2307.09973 - Eq. 5-6).
+class_balance.py (v2)
+=======================
+Sau khi xac nhan bang thuc nghiem: eta_fg > eta_bg XUYEN SUOT toan bo Stage
+II tren ca 2 domain shift target=RITE (khong dao dong, ket qua 20/20 epoch
+deu bg_ratio=1.0000 - xem log thuc te) - cong thuc CBMT goc (chi duoc phep
+GIAM trong so nen) hoan toan KHONG CO TAC DUNG voi vessel segmentation, vi
+tien canh (mach mau) von di kho hon nen trong SUOT qua trinh train, khong
+chi luc dau.
 
-Van de goc (CBMT Section 2.2, va DUNG voi vessel segmentation cua chung ta):
-tien canh (mach mau) chi chiem ~5-8% pixel (do bang diagnose_gap_v2.py).
-Neu tinh BCE binh thuong, so hang nen (background) se AP DAO loss, lam
-loang tin hieu hoc cho tien canh.
+File nay cung cap 3 CHIEN LUOC de thu nghiem co kiem soat, chon qua tham so
+`strategy`:
 
-Cong thuc goc (Eq. 5): tinh loss BCE trung binh RIENG cho pixel tien canh
-va hau canh, dua tren PSEUDO-LABEL (khong phai ground truth - vi day la
-SFUDA, khong co label that o dich):
-    eta_fg = trung binh loss tren pixel co pseudo_label=1
-    eta_bg = trung binh loss tren pixel co pseudo_label=0
+  'cbmt'       : cong thuc CBMT GOC (Tang et al. MICCAI 2023, Eq.5-6), chi
+                 duoc phep giam trong so nen (ratio in [0.1, 1.0]) - GIU LAI
+                 de doi chieu, da xac nhan KHONG CO TAC DUNG voi du lieu nay.
 
-Eq. 6: dung ty le eta_fg/eta_bg de CAN CHINH trong so so hang nen:
-    L_calibrated = E[ y*log(p) + (eta_fg/eta_bg)*(1-y)*log(1-p) ]
+  'symmetric'  : TONG QUAT HOA - ben nao dang co loss trung binh CAO HON
+                 (kho hon) thi duoc TANG trong so, khong co dinh "chi nen
+                 moi duoc dieu chinh" nhu ban CBMT goc. Voi du lieu vessel
+                 (tien canh luon kho hon), ky vong se LUON tang trong so
+                 tien canh - dung huong truc giac nhung CHUA CO BANG CHUNG
+                 thuc nghiem la co tot hon khong.
 
-Khac biet nho so voi ban CBMT goc: thay vi tinh lai eta tren TOAN BO
-dataset moi epoch (can 2-pass), ta dung EMA (exponential moving average)
-CAP NHAT LIEN TUC qua tung iteration - phu hop hon voi tap du lieu nho
-(20-35 anh) va so epoch it (5-10) cua TT-SFUDA, tranh phai cho het 1 epoch
-moi co so lieu dau tien de hieu chinh.
-
-Bo loc pixel "khong nhieu thong tin" (CBMT dung nguong alpha phuc tap dua
-tren |p-gamma|/|y-gamma|) duoc DON GIAN HOA thanh: chi tinh eta tren pixel
-co xac suat KHONG qua cuc tri (0.05 < p < 0.95) - dat duoc cung muc dich
-(loai pixel da qua "chac chan", khong dong gop thong tin) ma khong can
-tai hien chinh xac cong thuc loc phuc tap cua ban goc. CBMT tu bao cao ket
-qua ON DINH voi nhieu gia tri nguong loc khac nhau (Table 3 trong paper),
-nen don gian hoa nay duoc coi la chap nhan duoc.
+  'fixed_fg'   : DON GIAN NHAT - nhan co dinh trong so tien canh voi 1 he so
+                 (vd 2.0), KHONG can theo doi thong ke dong. Dung de kiem tra
+                 xem do phuc tap "dong" cua 'symmetric' co thuc su can thiet
+                 khong, hay chi can 1 hang so co dinh la du.
 """
 import torch
 import torch.nn as nn
@@ -39,37 +33,26 @@ import torch.nn.functional as F
 
 
 class ClassBalanceTracker:
-    def __init__(self, momentum=0.9, prob_low=0.05, prob_high=0.95,
-                 ratio_min=0.1, ratio_max=1.0):
+    def __init__(self, strategy='symmetric', momentum=0.9, prob_low=0.05, prob_high=0.95,
+                 ratio_min=0.1, ratio_max=1.0, fixed_fg_weight=2.0):
+        assert strategy in ('cbmt', 'symmetric', 'fixed_fg')
+        self.strategy = strategy
         self.momentum = momentum
         self.prob_low = prob_low
         self.prob_high = prob_high
-        # ratio_max=1.0 (khong phai 10.0 nhu ban truoc) - LY DO QUAN TRONG:
-        # cong thuc CBMT goc CHI thuc su "highlight foreground" khi
-        # eta_fg/eta_bg < 1 (nen de hon tien canh, giam trong so nen).
-        # Vessel segmentation co cau truc manh, KHO HON nen ngay ca khi
-        # model da hoc tot -> ty le nay co the >1 trong thuc te (nguoc voi
-        # gia dinh ngam cua CBMT tren du lieu optic cup goc), neu ap dung
-        # nguyen cong thuc se VO TINH TANG trong so nen - phan tac dung.
-        # Chan cung ratio_max=1.0 buoc cong thuc CHI DUOC PHEP giam trong so
-        # nen (hoac giu nguyen), khong bao gio tang - dung theo dung Y DINH
-        # da neu ro trong paper, khong lam tuong lai bi dao nguoc.
-        self.ratio_max = ratio_max
-        self.ratio_min = ratio_min
+        self.ratio_max = ratio_max   # chi dung cho strategy='cbmt'
+        self.ratio_min = ratio_min   # chi dung cho strategy='cbmt'/'symmetric'
+        self.fixed_fg_weight = fixed_fg_weight  # chi dung cho strategy='fixed_fg'
         self.eta_fg = None
         self.eta_bg = None
 
     @torch.no_grad()
     def update(self, output_logits, pseudo_label):
-        """Goi moi iteration VOI DU LIEU CUA CHINH ITERATION DO (khong can
-        cho het epoch) - cap nhat eta_fg/eta_bg qua EMA."""
+        if self.strategy == 'fixed_fg':
+            return  # khong can theo doi thong ke gi ca
+
         prob = torch.sigmoid(output_logits)
         per_pixel_bce = F.binary_cross_entropy_with_logits(output_logits, pseudo_label, reduction='none')
-
-        # bao ve: neu output_logits da co NaN/Inf (vi du do buoc truoc do da
-        # mat on dinh), BO QUA cap nhat lan nay - tranh lan truyen NaN vao
-        # eta_fg/eta_bg (moi khi da nhiem NaN, EMA se giu NaN MAI MAI vi
-        # moi phep toan voi NaN deu ra NaN).
         if not torch.isfinite(per_pixel_bce).all():
             return
 
@@ -80,7 +63,7 @@ class ClassBalanceTracker:
         fg_cnt = fg_mask.sum().item()
         bg_cnt = bg_mask.sum().item()
         if fg_cnt < 1 or bg_cnt < 1:
-            return  # khong du pixel "thong tin" trong batch nay, giu nguyen eta cu
+            return
 
         batch_eta_fg = (per_pixel_bce * fg_mask).sum().item() / fg_cnt
         batch_eta_bg = (per_pixel_bce * bg_mask).sum().item() / bg_cnt
@@ -91,40 +74,50 @@ class ClassBalanceTracker:
             self.eta_fg = self.momentum * self.eta_fg + (1 - self.momentum) * batch_eta_fg
             self.eta_bg = self.momentum * self.eta_bg + (1 - self.momentum) * batch_eta_bg
 
-    def get_ratio(self, eps=1e-6):
-        """Ty le eta_fg/eta_bg dung de can chinh trong so nen (Eq.6), DA
-        CHAN trong [ratio_min, ratio_max] de tranh mat on dinh so hoc.
-        Tra ve 1.0 (khong can chinh gi) neu chua co du lieu hoac gia tri
-        khong hop le (NaN/Inf)."""
+    def get_weights(self, eps=1e-6):
+        """Tra ve (weight_fg, weight_bg) - CACH DUY NHAT de lay trong so,
+        thay the get_ratio() cua ban v1 (chi tra ve 1 so cho nen)."""
+        if self.strategy == 'fixed_fg':
+            return self.fixed_fg_weight, 1.0
+
         if self.eta_fg is None or self.eta_bg is None:
-            return 1.0
-        ratio = self.eta_fg / (self.eta_bg + eps)
-        if not (ratio == ratio) or ratio in (float('inf'), float('-inf')):  # kiem tra NaN/Inf khong can import math
-            return 1.0
-        return max(self.ratio_min, min(self.ratio_max, ratio))
+            return 1.0, 1.0
+
+        raw_ratio = self.eta_fg / (self.eta_bg + eps)
+        if not (raw_ratio == raw_ratio) or raw_ratio in (float('inf'), float('-inf')):
+            return 1.0, 1.0
+
+        if self.strategy == 'cbmt':
+            # CHI duoc giam trong so nen (nhu ban goc), khong bao gio tang
+            bg_w = max(self.ratio_min, min(self.ratio_max, raw_ratio))
+            return 1.0, bg_w
+
+        else:  # 'symmetric'
+            raw_ratio = max(self.ratio_min, min(1.0 / self.ratio_min, raw_ratio))
+            if raw_ratio >= 1.0:
+                # tien canh dang kho hon -> tang trong so tien canh
+                return raw_ratio, 1.0
+            else:
+                # nen dang kho hon -> tang trong so nen (hiem gap voi vessel,
+                # nhung van xu ly dung neu xay ra)
+                return 1.0, 1.0 / raw_ratio
 
 
 class CalibratedBCEDiceLoss(nn.Module):
-    """Ban thay the BCEDiceLoss goc (losses.py), co THEM buoc can chinh
-    trong so nen theo Eq.6 CBMT. Dice term giu nguyen KHONG can chinh (Dice
-    von da it nhay voi mat can bang so luong pixel hon BCE)."""
-
     def __init__(self, smooth=1e-5):
         super().__init__()
         self.smooth = smooth
 
-    def forward(self, output_logits, target, bg_weight_ratio=1.0):
-        # chan an toan lan 2 (du ClassBalanceTracker da chan o [0.1, 1.0]) -
-        # phong khi ham nay duoc goi truc tiep voi ratio tu nguon khac
-        bg_weight_ratio = max(0.01, min(1.0, bg_weight_ratio))
+    def forward(self, output_logits, target, fg_weight=1.0, bg_weight=1.0):
+        fg_weight = max(0.01, min(10.0, fg_weight))
+        bg_weight = max(0.01, min(10.0, bg_weight))
 
         prob = torch.sigmoid(output_logits)
-        eps = 1e-6   # PHAI >= ~1e-6 de khong bi lam tron mat trong float32 gan 1.0
-                     # (1 - 1e-8 lam tron thanh dung 1.0 trong float32 -> log(0) = -inf)
+        eps = 1e-6   # PHAI >= ~1e-6, khong duoc dung 1e-8 (bi lam tron mat trong float32 gan 1.0)
         prob_c = prob.clamp(eps, 1 - eps)
 
-        fg_term = target * torch.log(prob_c)
-        bg_term = bg_weight_ratio * (1 - target) * torch.log(1 - prob_c)
+        fg_term = fg_weight * target * torch.log(prob_c)
+        bg_term = bg_weight * (1 - target) * torch.log(1 - prob_c)
         bce_calibrated = -(fg_term + bg_term).mean()
 
         intersection = (prob * target).sum()
@@ -132,8 +125,6 @@ class CalibratedBCEDiceLoss(nn.Module):
 
         loss = 0.5 * bce_calibrated + dice
         if not torch.isfinite(loss):
-            # phong ho cuoi cung: neu van ra NaN/Inf vi ly do khac, tra ve
-            # loss KHONG can chinh (ratio=1.0) thay vi lam sap ca qua trinh train
             fg_term = target * torch.log(prob_c)
             bg_term = (1 - target) * torch.log(1 - prob_c)
             bce_fallback = -(fg_term + bg_term).mean()
