@@ -109,8 +109,12 @@ class CalibratedBCEDiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, output_logits, target, fg_weight=1.0, bg_weight=1.0):
-        fg_weight = max(0.01, min(10.0, fg_weight))
-        bg_weight = max(0.01, min(10.0, bg_weight))
+        # tran duoc nang len 50.0 (thay vi 10.0) - vi fixed_fg la gia tri
+        # NGUOI DUNG CHU DONG chon (khong phai ty le dong khong kiem soat
+        # nhu 'symmetric'/'cbmt'), can it phong thu chat hon. Van giu tran
+        # de tranh nhap sai gia tri qua lon gay mat on dinh so hoc.
+        fg_weight = max(0.01, min(50.0, fg_weight))
+        bg_weight = max(0.01, min(50.0, bg_weight))
 
         prob = torch.sigmoid(output_logits)
         eps = 1e-6   # PHAI >= ~1e-6, khong duoc dung 1e-8 (bi lam tron mat trong float32 gan 1.0)
