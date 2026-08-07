@@ -40,12 +40,22 @@ import torch.nn.functional as F
 
 class ClassBalanceTracker:
     def __init__(self, momentum=0.9, prob_low=0.05, prob_high=0.95,
-                 ratio_min=0.1, ratio_max=10.0):
+                 ratio_min=0.1, ratio_max=1.0):
         self.momentum = momentum
         self.prob_low = prob_low
         self.prob_high = prob_high
-        self.ratio_min = ratio_min   # CHAN AN TOAN - tranh bg_ratio no lon lam mat on dinh
-        self.ratio_max = ratio_max   # gay NaN qua vai vong feedback (loss lon -> gradient lon -> logits no)
+        # ratio_max=1.0 (khong phai 10.0 nhu ban truoc) - LY DO QUAN TRONG:
+        # cong thuc CBMT goc CHI thuc su "highlight foreground" khi
+        # eta_fg/eta_bg < 1 (nen de hon tien canh, giam trong so nen).
+        # Vessel segmentation co cau truc manh, KHO HON nen ngay ca khi
+        # model da hoc tot -> ty le nay co the >1 trong thuc te (nguoc voi
+        # gia dinh ngam cua CBMT tren du lieu optic cup goc), neu ap dung
+        # nguyen cong thuc se VO TINH TANG trong so nen - phan tac dung.
+        # Chan cung ratio_max=1.0 buoc cong thuc CHI DUOC PHEP giam trong so
+        # nen (hoac giu nguyen), khong bao gio tang - dung theo dung Y DINH
+        # da neu ro trong paper, khong lam tuong lai bi dao nguoc.
+        self.ratio_max = ratio_max
+        self.ratio_min = ratio_min
         self.eta_fg = None
         self.eta_bg = None
 
@@ -104,9 +114,9 @@ class CalibratedBCEDiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, output_logits, target, bg_weight_ratio=1.0):
-        # chan an toan lan 2 (du ClassBalanceTracker da chan) - phong khi
-        # ham nay duoc goi truc tiep voi ratio tu nguon khac khong qua tracker
-        bg_weight_ratio = max(0.01, min(100.0, bg_weight_ratio))
+        # chan an toan lan 2 (du ClassBalanceTracker da chan o [0.1, 1.0]) -
+        # phong khi ham nay duoc goi truc tiep voi ratio tu nguon khac
+        bg_weight_ratio = max(0.01, min(1.0, bg_weight_ratio))
 
         prob = torch.sigmoid(output_logits)
         eps = 1e-6   # PHAI >= ~1e-6 de khong bi lam tron mat trong float32 gan 1.0
