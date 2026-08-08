@@ -441,6 +441,21 @@ def main():
     print('Merged (Teacher_R + Teacher_T) dice: %.4f' % merged_dice)
     print('Teacher_R only dice (xap xi): %.4f' % dice_r_only)
 
+    # --- DEBUG TAM: kiem tra Teacher_R va Teacher_T co thuc su khac nhau khong ---
+    with torch.no_grad():
+        sample_input, _, _ = next(iter(val_loader))
+        sample_input = sample_input.cuda()
+        out_r, _ = teacher_r(sample_input, mode='const')
+        out_t, _ = teacher_t(sample_input, mode='const')
+        diff = (torch.sigmoid(out_r) - torch.sigmoid(out_t)).abs()
+        print(f"[DEBUG] Chenh lech trung binh |Teacher_R - Teacher_T| = {diff.mean().item():.6f}")
+        print(f"[DEBUG] Chenh lech toi da = {diff.max().item():.6f}")
+        pred_r_bin = (torch.sigmoid(out_r) > 0.5).float()
+        pred_t_bin = (torch.sigmoid(out_t) > 0.5).float()
+        bin_diff = (pred_r_bin - pred_t_bin).abs().mean().item()
+        print(f"[DEBUG] Ty le pixel KHAC NHAU sau khi nhi phan hoa (>0.5): {bin_diff:.6f}")
+    # --- HET DEBUG ---
+
     os.makedirs(os.path.dirname(args.results_csv) or '.', exist_ok=True)
     write_header = not os.path.exists(args.results_csv)
     with open(args.results_csv, 'a', newline='') as f:
