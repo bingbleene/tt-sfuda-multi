@@ -52,6 +52,7 @@ from multi_teacher import MultiTeacherManager
 from masked_loss import MaskedBCEDiceLoss
 from class_balance import ClassBalanceTracker, CalibratedBCEDiceLoss
 from region_topology_teacher import TopologyTeacherLoss
+from frangi_prior import precompute_frangi_maps, FRANGI_BINARY_THRESHOLD_DEFAULT
 from unsupervised_early_stop import UnsupervisedEarlyStopper, ImageOnlyDataset
 
 from tt_sfuda_2d import (
@@ -62,6 +63,19 @@ from tt_sfuda_2d import (
 )
 
 cudnn.benchmark = True
+
+
+class ImageOnlyDatasetWithID(Dataset):
+    """Ke thua TRUC TIEP tu Dataset goc (khong qua ImageOnlyDataset, de KHONG
+    dong cham/sua doi file unsupervised_early_stop.py da duoc bao ve can than).
+    Giong het ImageOnlyDataset o cho BO MASK, nhung GIU LAI img_id de tra cuu
+    Frangi map da tinh truoc. img_id CHI la ten file, KHONG PHAI label, nen
+    khong vi pham nguyen tac "khong dung nhan that" cua che do unsupervised.
+    """
+
+    def __getitem__(self, idx):
+        img, mask, meta = super().__getitem__(idx)
+        return img, meta['img_id']
 
 
 def set_seed(seed):
@@ -127,12 +141,25 @@ def parse_args():
                          help='So vong lap soft-skeletonize trong clDice. '
                               'Nen kiem tra do day mach mau lon nhat trong anh '
                               'truoc khi doi gia tri nay.')
+    parser.add_argument('--use_frangi', action='store_true',
+                         help='Bat Frangi vesselness lam tin hieu bo sung khi sinh '
+                              'pseudo-label. Da kiem chung tren 15 anh (CHASE/HRF/RITE), '
+                              'Dice trung binh doc lap 0.4678, threshold co dinh 0.005.')
+    parser.add_argument('--frangi_threshold', type=float, default=FRANGI_BINARY_THRESHOLD_DEFAULT)
+    parser.add_argument('--frangi_band_low', type=float, default=0.05,
+                         help='Nguong duoi cua vung "nghi ngo" de Frangi duoc phep va vao. '
+                              'Dua tren debug thuc te: vung 0.05-0.3 co ve la noi cac '
+                              'model khac nhau nhieu hon vung 0.3-0.5 (mao mach mo).')
+    parser.add_argument('--frangi_band_high', type=float, default=0.3)
+    parser.add_argument('--frangi_cache', default=None)
     return parser.parse_args()
 
 
 def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion, optimizer,
                              ensemble_mode, class_balance_tracker=None, labels_available=True,
-                             lambda_cl=0.0, cldice_num_iter=10):
+                             lambda_cl=0.0, cldice_num_iter=10,
+                             frangi_maps=None, frangi_threshold=FRANGI_BINARY_THRESHOLD_DEFAULT,
+                             frangi_band=(0.05, 0.3)):
     """
     labels_available=False: train_loader la loader ANH THUAN TUY (khong co
     mask, vd tu ImageOnlyDataset) - dung khi thu nghiem early_stop_unsupervised,
@@ -152,10 +179,16 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
 
     for batch in train_loader:
         if labels_available:
-            input, target, _ = batch
+            input, target, meta = batch
             target = target.cuda()
+            img_id = meta['img_id'][0] if isinstance(meta, dict) else None
         else:
-            input = batch   # ImageOnlyDataset chi tra ve 1 tensor anh, khong co gi khac
+            if frangi_maps is not None:
+                input, img_id_batch = batch   # ImageOnlyDatasetWithID: (anh, img_id)
+                img_id = img_id_batch[0] if isinstance(img_id_batch, (list, tuple)) else img_id_batch
+            else:
+                input = batch   # ImageOnlyDataset chi tra ve 1 tensor anh, khong co gi khac
+                img_id = None
             target = None
 
         w_input = input.cuda()
@@ -168,6 +201,17 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
                 mean_trust_ratio.update(trust_mask.mean().item(), input.size(0))
             else:
                 w_output, msrc_feat = teacher_manager.predict(w_input, mode='const', ensemble_mode=ensemble_mode)
+
+                # --- Frangi: vá vào PSEUDO-LABEL MỀM (trước khi nhị phân hoá) ---
+                # o vung "nghi ngo" (band), neu Frangi tu tin manh, cong them
+                # tin hieu vao truoc khi ep cung ve 0/1.
+                if frangi_maps is not None and img_id in frangi_maps:
+                    fmap = torch.from_numpy(frangi_maps[img_id]).float().unsqueeze(0).unsqueeze(0).to(w_output.device)
+                    band_mask = ((w_output > frangi_band[0]) & (w_output < frangi_band[1])).float()
+                    frangi_confident = (fmap > frangi_threshold).float()
+                    patch = band_mask * frangi_confident
+                    w_output = torch.clamp(w_output + patch * fmap, 0.0, 1.0)
+
                 ps_output = w_output.detach().clone()
                 ps_output[ps_output >= 0.5] = 1
                 ps_output[ps_output < 0.5] = 0
@@ -360,6 +404,17 @@ def main():
     print(f"[INFO] Stage II se chay {n_epochs} epoch "
           f"({'ghi de tu --stage2_epochs' if args.stage2_epochs is not None else 'tu config goc'})")
 
+    frangi_maps = None
+    if args.use_frangi:
+        cache_path = args.frangi_cache or f'cache/frangi_{args.target}.npz'
+        frangi_maps = precompute_frangi_maps(
+            img_dir=os.path.join('inputs', args.target, 'train', 'images'),
+            img_ids=train_img_ids, img_ext=config['img_ext'],
+            input_h=config['input_h'], input_w=config['input_w'],
+            cache_path=cache_path)
+        print(f"[FRANGI] Da bat Frangi-assisted merge, threshold={args.frangi_threshold}, "
+              f"band=({args.frangi_band_low},{args.frangi_band_high})")
+
     early_stopper = UnsupervisedEarlyStopper(
         warmup_epochs=args.early_stop_warmup,
         window_size=args.early_stop_window,
@@ -387,7 +442,8 @@ def main():
         # stage2_train_loader: dung train_transform (CO augmentation, giong
         # het du lieu train_loader goc dua vao model) - chi khac o cho
         # KHONG BAO GIO tra ve mask cho vong lap Stage II.
-        stage2_train_ds = ImageOnlyDataset(
+        StageIIDatasetClass = ImageOnlyDatasetWithID if args.use_frangi else ImageOnlyDataset
+        stage2_train_ds = StageIIDatasetClass(
             img_ids=train_img_ids,
             img_dir=os.path.join('inputs', args.target, 'train', 'images'),
             mask_dir=os.path.join('inputs', args.target, 'train', 'masks'),
@@ -406,7 +462,10 @@ def main():
                                              tgt_optimizer, args.ensemble_mode, class_balance_tracker,
                                              labels_available=(early_stopper is None),
                                              lambda_cl=args.lambda_cl,
-                                             cldice_num_iter=args.cldice_num_iter)
+                                             cldice_num_iter=args.cldice_num_iter,
+                                             frangi_maps=frangi_maps,
+                                             frangi_threshold=args.frangi_threshold,
+                                             frangi_band=(args.frangi_band_low, args.frangi_band_high))
         log_msg = 'epoch %d/%d - train_loss %.4f' % (epoch + 1, n_epochs, train_log['loss'])
         if 'iou' in train_log:
             log_msg += ' - train_iou %.4f' % train_log['iou']
