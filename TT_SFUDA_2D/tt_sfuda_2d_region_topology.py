@@ -447,13 +447,31 @@ def main():
         sample_input = sample_input.cuda()
         out_r, _ = teacher_r(sample_input, mode='const')
         out_t, _ = teacher_t(sample_input, mode='const')
-        diff = (torch.sigmoid(out_r) - torch.sigmoid(out_t)).abs()
-        print(f"[DEBUG] Chenh lech trung binh |Teacher_R - Teacher_T| = {diff.mean().item():.6f}")
+        prob_r = torch.sigmoid(out_r)
+        prob_t = torch.sigmoid(out_t)
+        diff = (prob_r - prob_t).abs()
+        print(f"[DEBUG] Chenh lech trung binh TOAN ANH = {diff.mean().item():.6f}")
         print(f"[DEBUG] Chenh lech toi da = {diff.max().item():.6f}")
-        pred_r_bin = (torch.sigmoid(out_r) > 0.5).float()
-        pred_t_bin = (torch.sigmoid(out_t) > 0.5).float()
+
+        # Chi tinh trung binh o vung CA HAI hoac 1 trong 2 model nghi la mach mau
+        # (tranh bi 93% pixel nen keo trung binh xuong gan 0, che mat khac biet that)
+        relevant_mask = (prob_r > 0.1) | (prob_t > 0.1)
+        n_relevant = relevant_mask.sum().item()
+        if n_relevant > 0:
+            diff_relevant = diff[relevant_mask].mean().item()
+            print(f"[DEBUG] Chenh lech TRONG VUNG LIEN QUAN (prob>0.1 o it nhat 1 model) "
+                  f"= {diff_relevant:.6f} (tren {n_relevant} pixel)")
+        else:
+            print("[DEBUG] Khong co pixel nao vuot nguong 0.1 o ca 2 model - "
+                  "ca hai deu du doan gan nhu toan nen.")
+
+        pred_r_bin = (prob_r > 0.5).float()
+        pred_t_bin = (prob_t > 0.5).float()
         bin_diff = (pred_r_bin - pred_t_bin).abs().mean().item()
+        n_pos_r = pred_r_bin.sum().item()
+        n_pos_t = pred_t_bin.sum().item()
         print(f"[DEBUG] Ty le pixel KHAC NHAU sau khi nhi phan hoa (>0.5): {bin_diff:.6f}")
+        print(f"[DEBUG] So pixel duong tinh: Teacher_R={n_pos_r:.0f}, Teacher_T={n_pos_t:.0f}")
     # --- HET DEBUG ---
 
     os.makedirs(os.path.dirname(args.results_csv) or '.', exist_ok=True)
