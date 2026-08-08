@@ -59,6 +59,13 @@ def main():
             new_config.update(copy.deepcopy(EXTRA_KEYS))
 
             out_path = os.path.join('models', source, f'config_{target}_dualema.yml')
+            # XOA symlink/file cu truoc khi ghi - neu buoc setup truoc do lo
+            # tao out_path thanh symlink tro vao /kaggle/input (chi doc), ghi
+            # truc tiep se loi "Read-only file system". os.remove xoa dung
+            # CHINH symlink (khong dung theo duong dan no tro toi), an toan
+            # tuyet doi voi du lieu that trong Kaggle Dataset.
+            if os.path.islink(out_path) or os.path.exists(out_path):
+                os.remove(out_path)
             with open(out_path, 'w') as f:
                 yaml.dump(new_config, f, default_flow_style=False)
             print(f"[OK] Da tao {out_path}")
