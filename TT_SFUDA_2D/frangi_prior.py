@@ -266,7 +266,7 @@ def precompute_frangi_maps(img_dir: str, img_ids: list, img_ext: str,
             print(f"  [CANH BAO] khong doc duoc {img_path}, bo qua.")
             continue
         green = img[:, :, 1]
-        vmap = compute_frangi_map(green, scale_range=(2, 8))
+        vmap = compute_frangi_map(green, scale_range=(2, 8), use_gpu=False)
         vmap = cv2.resize(vmap, (input_w, input_h))
         frangi_maps[img_id] = vmap.astype(np.float32)
 
