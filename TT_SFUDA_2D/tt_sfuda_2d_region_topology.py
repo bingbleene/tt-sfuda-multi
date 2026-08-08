@@ -472,6 +472,20 @@ def main():
         n_pos_t = pred_t_bin.sum().item()
         print(f"[DEBUG] Ty le pixel KHAC NHAU sau khi nhi phan hoa (>0.5): {bin_diff:.6f}")
         print(f"[DEBUG] So pixel duong tinh: Teacher_R={n_pos_r:.0f}, Teacher_T={n_pos_t:.0f}")
+
+        # Kiem tra truc tiep xem uncertain_mask (0.3-0.5) co dang bat trung
+        # vung ma pred_r va pred_t thuc su khac nhau khong, hay lech vung.
+        from region_topology_teacher import soft_skeletonize
+        ent_r = entropy_map(prob_r)
+        for lam1, lam2 in [(0.3, 0.5), (0.1, 0.5), (0.05, 0.3)]:
+            um = ((prob_r > lam1) & (prob_r < lam2)).float()
+            n_uncertain = um.sum().item()
+            if n_uncertain > 0:
+                diff_in_band = (prob_r - prob_t).abs()[um.bool()].mean().item()
+            else:
+                diff_in_band = float('nan')
+            print(f"[DEBUG] Band uncertain_mask=({lam1},{lam2}): "
+                  f"{n_uncertain:.0f} pixel, chenh lech trung binh trong band = {diff_in_band:.6f}")
     # --- HET DEBUG ---
 
     os.makedirs(os.path.dirname(args.results_csv) or '.', exist_ok=True)
