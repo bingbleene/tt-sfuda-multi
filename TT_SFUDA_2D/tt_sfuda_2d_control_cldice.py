@@ -181,13 +181,14 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
             fg_w, bg_w = class_balance_tracker.get_weights()
             seg_loss = calibrated_criterion(output, ps_output, fg_weight=fg_w, bg_weight=bg_w)
             class_balance_tracker.update(output.detach(), ps_output)
-        elif topology_criterion is not None:
-            # Control experiment: Dice+BCE (criterion) + lambda_cl * clDice.
-            # KHONG ket hop voi trust_region/class_balance trong lan chay nay -
-            # de giu ablation sach (tach bach dung 1 bien so moi tai 1 thoi diem).
-            seg_loss = topology_criterion(output, ps_output, base_seg_loss_fn=criterion)
         else:
             seg_loss = criterion(output, ps_output)
+
+        # clDice CONG DOM vao seg_loss ben tren (khong loai tru class_balance nua) -
+        # sua lai so voi ban control rieng le truoc day, de dung cho cau hinh "Ours" day du.
+        if topology_criterion is not None:
+            cl_loss = topology_criterion.cldice(output, ps_output)
+            seg_loss = seg_loss + topology_criterion.lambda_cl * cl_loss
 
         const_loss = consistency_loss(msrc_feat, tgt_feat)
         loss = seg_loss + const_loss
