@@ -176,6 +176,7 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
     topology_criterion = TopologyTeacherLoss(
         lambda_cl=lambda_cl, num_iter=cldice_num_iter) if lambda_cl > 0 else None
     mean_trust_ratio = AverageMeter()
+    frangi_hit_counter = [0, 0]  # [so lan khop, tong so lan thu]
 
     for batch in train_loader:
         if labels_available:
@@ -205,7 +206,10 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
                 # --- Frangi: vá vào PSEUDO-LABEL MỀM (trước khi nhị phân hoá) ---
                 # o vung "nghi ngo" (band), neu Frangi tu tin manh, cong them
                 # tin hieu vao truoc khi ep cung ve 0/1.
+                if frangi_maps is not None:
+                    frangi_hit_counter[1] += 1  # tong so lan thu tra cuu
                 if frangi_maps is not None and img_id in frangi_maps:
+                    frangi_hit_counter[0] += 1  # so lan khop thanh cong
                     fmap = torch.from_numpy(frangi_maps[img_id]).float().unsqueeze(0).unsqueeze(0).to(w_output.device)
                     band_mask = ((w_output > frangi_band[0]) & (w_output < frangi_band[1])).float()
                     frangi_confident = (fmap > frangi_threshold).float()
@@ -259,6 +263,10 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
         teacher_manager.update(tgt_model)
 
     pbar.close()
+    if frangi_maps is not None:
+        n_match, n_total = frangi_hit_counter
+        print(f"  [FRANGI-DEBUG] Ty le img_id khop voi frangi_maps: "
+              f"{n_match}/{n_total} ({100*n_match/max(n_total,1):.1f}%)")
     result = OrderedDict([('loss', avg_meters['loss'].avg)])
     if labels_available:
         result['iou'] = avg_meters['iou'].avg
