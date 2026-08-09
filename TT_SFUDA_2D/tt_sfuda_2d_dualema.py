@@ -52,6 +52,7 @@ from multi_teacher import MultiTeacherManager
 from masked_loss import MaskedBCEDiceLoss
 from class_balance import ClassBalanceTracker, CalibratedBCEDiceLoss
 from unsupervised_early_stop import UnsupervisedEarlyStopper, ImageOnlyDataset
+from clahe_transform import ClaheLAB
 
 from tt_sfuda_2d import (
     build_strong_augmentation,
@@ -82,6 +83,11 @@ def parse_args():
                          choices=['mean', 'weighted', 'confidence', 'warmup', 'trust_region'])
     parser.add_argument('--slow_keep_rate', type=float, default=None)
     parser.add_argument('--fast_weight', type=float, default=None)
+    parser.add_argument('--use_clahe', action='store_true',
+                         help='Bat CLAHE (chuan hoa mau/tuong phan tren kenh L cua LAB) - '
+                              'CHI nen bat cho domain shift co domain gap lon da xac nhan '
+                              'qua zero-shot (vd HRF->RITE: +0.19 Dice zero-shot), KHONG bat '
+                              'dai tra (HRF->CHASE zero-shot cho thay khong cai thien: -0.002).')
     parser.add_argument('--results_csv', default='results_dualema.csv')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--stage1_ckpt', default=None,
@@ -241,10 +247,12 @@ def main():
     train_transform = Compose([
         RandomRotate90(),
         transforms.Flip(),
+        *([ClaheLAB(clip_limit=2.0)] if args.use_clahe else []),
         Resize(config['input_h'], config['input_w']),
         transforms.Normalize(),
     ])
     val_transform = Compose([
+        *([ClaheLAB(clip_limit=2.0)] if args.use_clahe else []),
         Resize(config['input_h'], config['input_w']),
         transforms.Normalize(),
     ])
