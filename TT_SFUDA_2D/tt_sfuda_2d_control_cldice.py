@@ -214,7 +214,13 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
                     band_mask = ((w_output > frangi_band[0]) & (w_output < frangi_band[1])).float()
                     frangi_confident = (fmap > frangi_threshold).float()
                     patch = band_mask * frangi_confident
-                    w_output = torch.clamp(w_output + patch * fmap, 0.0, 1.0)
+                    # DAY HAN xac suat len cao (0.9) o vung Frangi tu tin, thay
+                    # vi CONG gia tri fmap tho (co the qua nho, khong du vuot
+                    # nguong 0.5 khi nhi phan hoa - da xac nhan qua debug thuc
+                    # te: img_id khop 100% nhung Dice khong doi vi patch qua nhe).
+                    w_output = torch.where(patch.bool(),
+                                            torch.clamp(w_output + 0.9, 0.0, 1.0),
+                                            w_output)
 
                 ps_output = w_output.detach().clone()
                 ps_output[ps_output >= 0.5] = 1
