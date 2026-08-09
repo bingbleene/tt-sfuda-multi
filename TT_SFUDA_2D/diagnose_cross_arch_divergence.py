@@ -154,13 +154,17 @@ def _report_divergence(teacher_r, teacher_x, loader, disagree_threshold, tag, ma
 
     total_pixels, disagree_pixels = 0, 0
     total_relevant, disagree_relevant = 0, 0
-    # Do them chenh lech O TUNG TANG FEATURE (x1_0..x4_0) - de biet chinh xac
-    # sai khac bi "chet" o tang nao, thay vi chi thay output cuoi = 0 ma
-    # khong ro nguyen nhan (giup debug nhanh hon neu v2 nay van chua du).
     level_names = ['x1_0', 'x2_0', 'x3_0', 'x4_0']
     level_diff_sum = [0.0] * 4
     level_norm_sum = [0.0] * 4
     n_batch = 0
+
+    # MOI: thong ke tho de phat hien COLLAPSE (ca 2 model du doan gan nhu
+    # toan nen, khong con pixel nao "co y nghia" de so sanh - dieu nay se
+    # lam disagreement_rate trong ao la 0 du ben trong feature co khac nhau).
+    sum_prob_r, sum_prob_x = 0.0, 0.0
+    n_pixels_total = 0
+    n_pos_r_gt50, n_pos_x_gt50 = 0, 0
 
     for i, (input, _, _) in enumerate(loader):
         if i >= max_batches:
@@ -180,6 +184,12 @@ def _report_divergence(teacher_r, teacher_x, loader, disagree_threshold, tag, ma
         total_relevant += relevant.sum().item()
         disagree_relevant += (disagree & relevant).sum().item()
 
+        sum_prob_r += prob_r.sum().item()
+        sum_prob_x += prob_x.sum().item()
+        n_pixels_total += prob_r.numel()
+        n_pos_r_gt50 += (prob_r > 0.5).sum().item()
+        n_pos_x_gt50 += (prob_x > 0.5).sum().item()
+
         for lvl in range(4):
             fr, fx = feat_r[lvl], feat_x[lvl]
             level_diff_sum[lvl] += (fr - fx).abs().mean().item()
@@ -188,18 +198,27 @@ def _report_divergence(teacher_r, teacher_x, loader, disagree_threshold, tag, ma
 
     global_rate = disagree_pixels / max(total_pixels, 1)
     relevant_rate = disagree_relevant / max(total_relevant, 1)
+    mean_prob_r = sum_prob_r / n_pixels_total
+    mean_prob_x = sum_prob_x / n_pixels_total
+    frac_relevant = total_relevant / n_pixels_total
 
     print(f"  [DIVERGENCE @ {tag}] global_disagreement_rate={global_rate:.4f} "
           f"({global_rate*100:.2f}%), disagreement_in_vessel_region={relevant_rate:.4f} "
           f"({relevant_rate*100:.2f}%) tren {min(max_batches, len(loader))} anh")
 
+    print(f"  [COLLAPSE CHECK @ {tag}] mean_prob_R={mean_prob_r:.5f}, mean_prob_X={mean_prob_x:.5f}, "
+          f"so_pixel_relevant(prob>0.1 o it nhat 1 model)/tong = {frac_relevant:.5f} "
+          f"({total_relevant} pixel), pixel_duong_tinh(>0.5): R={n_pos_r_gt50}, X={n_pos_x_gt50}")
+    if frac_relevant < 0.01:
+        print(f"    [!] CANH BAO: chi {frac_relevant*100:.3f}% pixel vuot nguong 0.1 o CA 2 model - "
+              f"disagreement_rate=0 co the CHI la vi khong con gi de so sanh (model dang collapse "
+              f"ve du doan toan nen), KHONG PHAI vi kien truc khong du khac biet. Neu dung, day la "
+              f"van de KHAC voi van de phan ky - can xem lai vi sao model collapse truoc.")
+
     level_report = ", ".join(
         f"{name}: {level_diff_sum[i]/n_batch:.6f} (tuong doi ~{100*level_diff_sum[i]/level_norm_sum[i]:.2f}%)"
         for i, name in enumerate(level_names))
     print(f"  [DIVERGENCE PER-LEVEL @ {tag}] {level_report}")
-    print(f"    -> neu x1_0/x2_0/x3_0 gan 0 nhung x4_0 khac 0 ro: sai khac dang bi 'chet' "
-          f"o cac tang decoder phia sau do skip connection. Can dat diem khac biet kien "
-          f"truc o tang NONG hon (x2_0 hoac x1_0), khong chi bottleneck.")
 
     teacher_r.train()
     teacher_x.train()
