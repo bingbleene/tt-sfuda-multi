@@ -72,9 +72,24 @@ class ASPPResidual(nn.Module):
     """4 nhanh dilated conv (rate 1,2,4,8) + project ve lai so channel goc,
     CONG DON (residual) vao input - khong thay the, chi bo sung ngu canh
     da ty le. Giu nguyen channel count nen ghep truc tiep vao UNet chuan
-    ma khong lam vo shape."""
+    ma khong lam vo shape.
 
-    def __init__(self, channels, dilations=(1, 2, 4, 8)):
+    THAM SO MOI - residual_scale (them sau khi do thuc te):
+    Lan dau (residual_scale=1.0, tuc KHONG scale) cho ket qua x3_0 lech
+    ~500-6900% so voi bien do goc - qua lon. VGGBlock trong repo nay
+    KHONG dung BatchNorm trong forward (chi Conv+ReLU thuan), nen khong co
+    gi kiem soat bien do. Nhieu qua manh di qua ReLU + 4 tang conv pretrained
+    phia sau co the bi "bao hoa" ve cung 1 trang thai o CA HAI model (ca hai
+    deu bi ReLU cat ve 0 o nhung kenh bi nhieu day am), khien dau ra cuoi
+    lai GIONG NHAU du feature noi bo khac nhau cuc lon - phan tac dung.
+
+    residual_scale < 1.0 giu bien do dong gop cua ASPP o muc "dang ke nhung
+    khong lan at" (muc tieu ban dau: lech tuong doi ~15-40% o x3_0/x4_0,
+    thay vi hang tram/nghin %). Can do lai bang diagnose_cross_arch_
+    divergence.py sau khi doi thong so nay, KHONG doan mo.
+    """
+
+    def __init__(self, channels, dilations=(1, 2, 4, 8), residual_scale=0.15):
         super().__init__()
         branch_ch = channels // len(dilations)
         self.branches = nn.ModuleList([
@@ -87,11 +102,12 @@ class ASPPResidual(nn.Module):
         self.project = nn.Conv2d(branch_ch * len(dilations), channels, 1)
         self.bn_out = nn.BatchNorm2d(channels)
         self.relu = nn.ReLU(inplace=True)
+        self.residual_scale = residual_scale
 
     def forward(self, x):
         feats = torch.cat([b(x) for b in self.branches], dim=1)
         residual = self.bn_out(self.project(feats))
-        return self.relu(x + residual)  # residual, KHONG thay the x
+        return self.relu(x + self.residual_scale * residual)
 
 
 class UNetDilatedBottleneck(nn.Module):
