@@ -154,13 +154,20 @@ def _report_divergence(teacher_r, teacher_x, loader, disagree_threshold, tag, ma
 
     total_pixels, disagree_pixels = 0, 0
     total_relevant, disagree_relevant = 0, 0
+    # Do them chenh lech O TUNG TANG FEATURE (x1_0..x4_0) - de biet chinh xac
+    # sai khac bi "chet" o tang nao, thay vi chi thay output cuoi = 0 ma
+    # khong ro nguyen nhan (giup debug nhanh hon neu v2 nay van chua du).
+    level_names = ['x1_0', 'x2_0', 'x3_0', 'x4_0']
+    level_diff_sum = [0.0] * 4
+    level_norm_sum = [0.0] * 4
+    n_batch = 0
 
     for i, (input, _, _) in enumerate(loader):
         if i >= max_batches:
             break
         input = input.cuda()
-        out_r, _ = teacher_r(input, mode='const')
-        out_x, _ = teacher_x(input, mode='const')
+        out_r, feat_r = teacher_r(input, mode='const')
+        out_x, feat_x = teacher_x(input, mode='const')
         prob_r = torch.sigmoid(out_r)
         prob_x = torch.sigmoid(out_x)
         diff = (prob_r - prob_x).abs()
@@ -173,12 +180,26 @@ def _report_divergence(teacher_r, teacher_x, loader, disagree_threshold, tag, ma
         total_relevant += relevant.sum().item()
         disagree_relevant += (disagree & relevant).sum().item()
 
+        for lvl in range(4):
+            fr, fx = feat_r[lvl], feat_x[lvl]
+            level_diff_sum[lvl] += (fr - fx).abs().mean().item()
+            level_norm_sum[lvl] += fr.abs().mean().item() + 1e-8
+        n_batch += 1
+
     global_rate = disagree_pixels / max(total_pixels, 1)
     relevant_rate = disagree_relevant / max(total_relevant, 1)
 
     print(f"  [DIVERGENCE @ {tag}] global_disagreement_rate={global_rate:.4f} "
           f"({global_rate*100:.2f}%), disagreement_in_vessel_region={relevant_rate:.4f} "
           f"({relevant_rate*100:.2f}%) tren {min(max_batches, len(loader))} anh")
+
+    level_report = ", ".join(
+        f"{name}: {level_diff_sum[i]/n_batch:.6f} (tuong doi ~{100*level_diff_sum[i]/level_norm_sum[i]:.2f}%)"
+        for i, name in enumerate(level_names))
+    print(f"  [DIVERGENCE PER-LEVEL @ {tag}] {level_report}")
+    print(f"    -> neu x1_0/x2_0/x3_0 gan 0 nhung x4_0 khac 0 ro: sai khac dang bi 'chet' "
+          f"o cac tang decoder phia sau do skip connection. Can dat diem khac biet kien "
+          f"truc o tang NONG hon (x2_0 hoac x1_0), khong chi bottleneck.")
 
     teacher_r.train()
     teacher_x.train()

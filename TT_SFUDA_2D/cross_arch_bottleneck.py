@@ -113,7 +113,16 @@ class UNetDilatedBottleneck(nn.Module):
         self.conv4_0 = VGGBlock(nb_filter[3], nb_filter[4], nb_filter[4])
 
         # DIEM KHAC BIET KIEN TRUC THAT SU - khong co trong archs.UNet.
-        self.aspp = ASPPResidual(nb_filter[4], dilations=(1, 2, 4, 8))
+        # v2: DAT O CA x3_0 (truoc khi pool xuong bottleneck) LAN x4_0, khong
+        # chi rieng bottleneck. Ly do (rut ra tu ket qua do thuc te lan v1):
+        # U-Net co skip connection rat manh - neu chi khac o x4_0, sai khac do
+        # bi "pha loang" qua 3 tang decoder con lai, moi tang deu nhan them
+        # skip tu x3_0/x2_0/x1_0 GIONG HET nhau giua 2 model. Dat them 1 diem
+        # khac biet o x3_0 nghia la CA skip connection dau tien (vao conv3_1)
+        # LAN duong bottleneck (qua pool(x3_0) -> conv4_0 -> aspp4) deu mang
+        # thong tin khac nhau - sai khac khong con bi 1 tang decoder "an" di.
+        self.aspp3 = ASPPResidual(nb_filter[3], dilations=(1, 2, 4))
+        self.aspp4 = ASPPResidual(nb_filter[4], dilations=(1, 2, 4, 8))
 
         self.conv3_1 = VGGBlock(nb_filter[3] + nb_filter[4], nb_filter[3], nb_filter[3])
         self.conv2_2 = VGGBlock(nb_filter[2] + nb_filter[3], nb_filter[2], nb_filter[2])
@@ -127,8 +136,9 @@ class UNetDilatedBottleneck(nn.Module):
         x1_0 = self.conv1_0(self.pool(x0_0))
         x2_0 = self.conv2_0(self.pool(x1_0))
         x3_0 = self.conv3_0(self.pool(x2_0))
+        x3_0 = self.aspp3(x3_0)  # << diem khac biet #1 - anh huong CA skip lan bottleneck
         x4_0 = self.conv4_0(self.pool(x3_0))
-        x4_0 = self.aspp(x4_0)  # << diem khac biet duy nhat so voi archs.UNet
+        x4_0 = self.aspp4(x4_0)  # << diem khac biet #2
 
         x3_1 = self.conv3_1(torch.cat([x3_0, self.up(x4_0)], 1))
         x2_2 = self.conv2_2(torch.cat([x2_0, self.up(x3_1)], 1))
