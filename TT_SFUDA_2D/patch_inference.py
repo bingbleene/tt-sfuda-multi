@@ -29,7 +29,24 @@ import cv2
 import torch
 from albumentations.augmentations import transforms
 
-_normalize = transforms.Normalize()
+_albu_normalize = transforms.Normalize()
+
+
+def normalize_like_dataset(image_bgr_uint8: np.ndarray) -> np.ndarray:
+    """PHAI khop CHINH XAC voi dataset.py that: Compose transform (bao gom
+    transforms.Normalize() albumentations) RoI COIN chia them /255 MOT LAN
+    NUA sau do (dong 'img = img.astype("float32") / 255' trong dataset.py).
+    Day la quirk co san trong pipeline goc - model DA DUOC TRAIN theo dung
+    scale nay, nen suy luan phai lap lai y het, du nhin la "chuan hoa kep"
+    la thua. BO QUA buoc nay se lam input sai lech ~255 lan so voi scale
+    model quen -> bao hoa toan mang -> du doan vo nghia (day chinh la
+    nguyen nhan Dice=0.0000 tuyet doi o ca 2 cach trong lan chay truoc).
+
+    LUU Y: anh dau vao PHAI la BGR (cv2.imread mac dinh, KHONG chuyen RGB) -
+    dataset.py khong goi cvtColor, giu nguyen BGR."""
+    img = _albu_normalize(image=image_bgr_uint8)['image']
+    img = img.astype('float32') / 255.0
+    return img
 
 
 def tile_positions(h, w, patch_h, patch_w, stride_h, stride_w):
@@ -90,7 +107,7 @@ def patch_predict_native(model, image_native_rgb: np.ndarray, patch_size,
         batch_patches, batch_valid = [], []
         for (y0, x0) in batch_positions:
             patch, vh, vw = _get_patch(image_native_rgb, y0, x0, patch_h, patch_w)
-            patch_norm = _normalize(image=patch)['image']
+            patch_norm = normalize_like_dataset(patch)
             batch_patches.append(patch_norm.transpose(2, 0, 1))
             batch_valid.append((y0, x0, vh, vw))
 

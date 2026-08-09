@@ -24,10 +24,9 @@ import cv2
 import yaml
 import numpy as np
 import torch
-from albumentations.augmentations import transforms
 
 import archs
-from patch_inference import patch_predict_native
+from patch_inference import patch_predict_native, normalize_like_dataset
 
 
 def parse_args():
@@ -68,7 +67,6 @@ def main():
     model.load_state_dict(torch.load(args.checkpoint))
     model.eval()
 
-    normalize = transforms.Normalize()
     patch_size = (config['input_h'], config['input_w'])
 
     dice_resize_list, dice_patch_list = [], []
@@ -80,17 +78,17 @@ def main():
             print(f"  [BO QUA] khong tim thay mask cho {img_id}")
             continue
 
+        # GIU NGUYEN BGR - dataset.py that KHONG chuyen RGB (cv2.imread mac dinh la BGR).
         img_bgr = cv2.imread(img_path)
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        native_h, native_w = img_rgb.shape[:2]
+        native_h, native_w = img_bgr.shape[:2]
 
         gt = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         gt_native = cv2.resize(gt, (native_w, native_h), interpolation=cv2.INTER_NEAREST)
         gt_binary = (gt_native > 127).astype(np.uint8)
 
         # --- (A) CU: resize toan anh ---
-        img_resized = cv2.resize(img_rgb, (config['input_w'], config['input_h']))
-        img_norm = normalize(image=img_resized)['image']
+        img_resized = cv2.resize(img_bgr, (config['input_w'], config['input_h']))
+        img_norm = normalize_like_dataset(img_resized)  # khop dung dataset.py (Normalize + /255 lan 2)
         tensor = torch.from_numpy(img_norm.transpose(2, 0, 1)).float().unsqueeze(0).cuda()
         with torch.no_grad():
             prob_small = torch.sigmoid(model(tensor)).cpu().numpy()[0, 0]
@@ -99,7 +97,7 @@ def main():
         d_resize = dice_score(pred_resize, gt_binary)
 
         # --- (B) MOI: patch tu anh goc, khong resize ---
-        prob_patch_native = patch_predict_native(model, img_rgb, patch_size,
+        prob_patch_native = patch_predict_native(model, img_bgr, patch_size,
                                                    overlap_ratio=args.overlap_ratio)
         pred_patch = (prob_patch_native > args.threshold).astype(np.uint8)
         d_patch = dice_score(pred_patch, gt_binary)
