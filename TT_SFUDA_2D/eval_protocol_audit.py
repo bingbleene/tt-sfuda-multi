@@ -87,6 +87,15 @@ def run_audit(domain_shift: str, view: str, seed: int, device: str, ckpt_root: s
     source, target = domain_shift.split("2")
     use_clahe = (view == "clahe")
 
+    # QUAN TRONG — sua bug: tt_sfuda_2d_dualema.py khi train GHI DE
+    # cfg['input_h']/cfg['input_w'] bang --input_size TRUOC khi build
+    # transform. Ban dau file nay quen lam buoc do nen doc thang YAML goc
+    # (mac dinh 512 cho ca 4 shift) -> A/B bi danh gia SAI resolution
+    # (512 thay vi 384/768/...). Phai override GIONG HET training script.
+    resolution = ALL_SHIFTS[domain_shift]
+    cfg["input_h"] = resolution
+    cfg["input_w"] = resolution
+
     ckpt_path = os.path.join(ckpt_root, domain_shift, f"{view}_seed{seed}", "model.pth")
     if not os.path.exists(ckpt_path):
         raise RuntimeError(f"Thieu checkpoint: {ckpt_path}")
@@ -139,6 +148,10 @@ def run_audit(domain_shift: str, view: str, seed: int, device: str, ckpt_root: s
                       f"tgt.shape={tuple(tgt.shape)} "
                       f"tgt.dtype={tgt.dtype} "
                       f"tgt.min={tgt.min().item():.3f} tgt.max={tgt.max().item():.3f}")
+                assert inp.shape[-1] == resolution and inp.shape[-2] == resolution, (
+                    f"BUG: inp resolution {tuple(inp.shape[-2:])} != {resolution} "
+                    f"da khoa cho {domain_shift} — kiem tra lai override cfg['input_h']/['input_w']."
+                )
                 first_batch_debug_printed = True
             inp = inp.to(device)
             out = model(inp)
@@ -158,7 +171,6 @@ def run_audit(domain_shift: str, view: str, seed: int, device: str, ckpt_root: s
     # ============================================================
     img_dir = os.path.join("inputs", target, "test", "images")
     mask_dir = os.path.join("inputs", target, "test", "masks", "0")
-    resolution = ALL_SHIFTS[domain_shift]
 
     dice_C_list = []
     for iid in val_img_ids:
