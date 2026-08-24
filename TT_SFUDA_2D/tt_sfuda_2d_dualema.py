@@ -124,6 +124,23 @@ def parse_args():
     parser.add_argument('--early_stop_unstable_count', type=int, default=3,
                          help='So epoch bat on TRONG cua so gan nhat de kich hoat dung (khong can lien tiep)')
     parser.add_argument('--early_stop_threshold', type=float, default=0.20)
+    parser.add_argument('--input_size', type=int, default=None,
+                         help='Neu dat: GHI DE input_h/input_w tu config goc bang '
+                              'gia tri vuong nay (vd 768). Dung khi can chay o resolution '
+                              'da freeze rieng cho tung shift ma khong sua truc tiep file '
+                              'config yml tren dia (vd Tier 2 diagnostic).')
+    parser.add_argument('--tier2_diagnostic', action='store_true',
+                         help='Tier-2 diversity-survival diagnostic (xem tier2_survival.py): '
+                              'KHONG doc target test mask (bo val_loader/validate hoan toan, '
+                              'ke ca theo doi tham khao moi epoch), KHONG early-stop/rollback, '
+                              'Stage II luon dung ImageOnlyDataset (khong mask), ep '
+                              'cudnn.benchmark=False + cudnn.deterministic=True, luu '
+                              'tgt_model.state_dict() tai epoch_0 (= Stage-I state, truoc khi '
+                              'vao Stage II) va epoch_1..N (cuoi moi epoch Stage II) vao '
+                              '--tier2_ckpt_dir. BAT BUOC di kem --stage1_ckpt tro toi '
+                              'checkpoint DA TON TAI (khong train Stage I trong lan chay nay).')
+    parser.add_argument('--tier2_ckpt_dir', default=None,
+                         help='Thu muc luu epoch_0.pth..epoch_N.pth khi bat --tier2_diagnostic.')
     return parser.parse_args()
 
 
@@ -218,11 +235,35 @@ def sfuda_task_multiteacher(train_loader, teacher_manager, tgt_model, criterion,
 def main():
     run_start_time = datetime.now()
     args = parse_args()
+
+    if args.tier2_diagnostic:
+        assert args.stage1_ckpt is not None and os.path.exists(args.stage1_ckpt), (
+            "--tier2_diagnostic bat buoc --stage1_ckpt tro toi checkpoint DA TON TAI "
+            "(khong train Stage I trong lan chay chan doan nay). Chay 1 lan KHONG co "
+            "--tier2_diagnostic truoc de tao cache, hoac tro dung duong dan da co."
+        )
+        assert args.tier2_ckpt_dir is not None, "--tier2_diagnostic can --tier2_ckpt_dir."
+        assert not args.early_stop_unsupervised, (
+            "--tier2_diagnostic khong duoc dung chung --early_stop_unsupervised "
+            "(rollback la confound cho phep do 'survival qua adaptation tu nhien')."
+        )
+        os.makedirs(args.tier2_ckpt_dir, exist_ok=True)
+        cudnn.benchmark = False
+        cudnn.deterministic = True
+        print("[TIER2] Che do chan doan: khong doc target mask, khong validate, "
+              "khong early-stop/rollback, cudnn deterministic=True.")
+
     set_seed(args.seed)
 
     config_file = "config_" + args.target + "_dualema"
     with open('models/%s/%s.yml' % (args.source, config_file), 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
+
+    if args.input_size is not None:
+        print(f"[INFO] Ghi de input_h/input_w tu config ({config['input_h']}x{config['input_w']}) "
+              f"thanh {args.input_size}x{args.input_size} (--input_size).")
+        config['input_h'] = args.input_size
+        config['input_w'] = args.input_size
 
     teachers = config['teachers']
     if args.single_teacher:
@@ -267,15 +308,21 @@ def main():
         train_dataset, batch_size=1, shuffle=True,
         num_workers=config['num_workers'], drop_last=True)
 
-    val_dataset = Dataset(
-        img_ids=val_img_ids,
-        img_dir=os.path.join('inputs', args.target, 'test', 'images'),
-        mask_dir=os.path.join('inputs', args.target, 'test', 'masks'),
-        img_ext=config['img_ext'], mask_ext=config['mask_ext'],
-        num_classes=config['num_classes'], transform=val_transform)
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=1, shuffle=False,
-        num_workers=config['num_workers'], drop_last=False)
+    if args.tier2_diagnostic:
+        # KHONG tao val_dataset/val_loader — Tier 2 khong duoc phep cham vao
+        # target test mask duoi bat ky hinh thuc nao, ke ca "chi tham khao".
+        val_loader = None
+        print("[TIER2] Bo qua val_dataset/val_loader (khong doc target test mask).")
+    else:
+        val_dataset = Dataset(
+            img_ids=val_img_ids,
+            img_dir=os.path.join('inputs', args.target, 'test', 'images'),
+            mask_dir=os.path.join('inputs', args.target, 'test', 'masks'),
+            img_ext=config['img_ext'], mask_ext=config['mask_ext'],
+            num_classes=config['num_classes'], transform=val_transform)
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset, batch_size=1, shuffle=False,
+            num_workers=config['num_workers'], drop_last=False)
 
     print("Loading source trained model...!!!")
     msrc_model = archs.__dict__[config['arch']](config['num_classes'],
@@ -298,11 +345,15 @@ def main():
 
     criterion = losses.__dict__[config['loss']]().cuda()
 
-    print("")
-    print("Performing source only model evaluation...!!!")
-    val_log = validate(val_loader, msrc_model, criterion)
-    source_only_dice = val_log['dice']
-    print('Source_only dice: %.4f' % (source_only_dice))
+    if args.tier2_diagnostic:
+        source_only_dice = None
+        print("[TIER2] Bo qua source-only evaluation (can val_loader co nhan).")
+    else:
+        print("")
+        print("Performing source only model evaluation...!!!")
+        val_log = validate(val_loader, msrc_model, criterion)
+        source_only_dice = val_log['dice']
+        print('Source_only dice: %.4f' % (source_only_dice))
 
     # ================== DIEM KHAC BIET CHINH so voi v2 ==================
     if args.stage1_ckpt is not None and os.path.exists(args.stage1_ckpt):
@@ -334,6 +385,11 @@ def main():
     tgt_model.cuda()
     tgt_model.train()
 
+    if args.tier2_diagnostic:
+        epoch0_path = os.path.join(args.tier2_ckpt_dir, 'epoch_0.pth')
+        torch.save(tgt_model.state_dict(), epoch0_path)
+        print(f"[TIER2] Da luu epoch_0 (= Stage-I state, truoc Stage II) vao {epoch0_path}")
+
     print("")
     print(f"Khoi tao {len(teachers)} teacher, topology='{args.topology}', "
           f"ensemble_mode='{args.ensemble_mode}': {teachers}")
@@ -357,26 +413,31 @@ def main():
         ratio_change_threshold=args.early_stop_threshold) if args.early_stop_unsupervised else None
 
     image_only_loader = None
-    if early_stopper is not None:
+    if early_stopper is not None or args.tier2_diagnostic:
         # ImageOnlyDataset KE THUA Dataset goc (xem unsupervised_early_stop.py)
         # - dam bao pixel giong tuyet doi, chi khac o cho KHONG tra ve mask.
         # Van phai truyen mask_dir hop le (lop cha can de doc, du bi bo o
         # __getitem__ cua lop con) - day la du lieu THAT, khong phai gia.
 
-        # image_only_loader: dung val_transform (KHONG augmentation ngau
-        # nhien) - do ty le du doan can ON DINH qua cac epoch de phat hien
-        # troi dat that su, tranh nhieu tu augmentation ngau nhien.
-        image_only_ds = ImageOnlyDataset(
-            img_ids=train_img_ids,
-            img_dir=os.path.join('inputs', args.target, 'train', 'images'),
-            mask_dir=os.path.join('inputs', args.target, 'train', 'masks'),
-            img_ext=config['img_ext'], mask_ext=config['mask_ext'],
-            num_classes=config['num_classes'], transform=val_transform)
-        image_only_loader = torch.utils.data.DataLoader(image_only_ds, batch_size=4, shuffle=False, num_workers=2)
+        if early_stopper is not None:
+            # image_only_loader: dung val_transform (KHONG augmentation ngau
+            # nhien) - do ty le du doan can ON DINH qua cac epoch de phat hien
+            # troi dat that su, tranh nhieu tu augmentation ngau nhien.
+            # KHONG can cho --tier2_diagnostic vi early_stopper luon None o do
+            # (xem assert dau main()).
+            image_only_ds = ImageOnlyDataset(
+                img_ids=train_img_ids,
+                img_dir=os.path.join('inputs', args.target, 'train', 'images'),
+                mask_dir=os.path.join('inputs', args.target, 'train', 'masks'),
+                img_ext=config['img_ext'], mask_ext=config['mask_ext'],
+                num_classes=config['num_classes'], transform=val_transform)
+            image_only_loader = torch.utils.data.DataLoader(image_only_ds, batch_size=4, shuffle=False, num_workers=2)
 
         # stage2_train_loader: dung train_transform (CO augmentation, giong
         # het du lieu train_loader goc dua vao model) - chi khac o cho
-        # KHONG BAO GIO tra ve mask cho vong lap Stage II.
+        # KHONG BAO GIO tra ve mask cho vong lap Stage II. Dung ca khi
+        # --tier2_diagnostic (du early_stopper la None) de dam bao Stage II
+        # khong bao gio doc mask, ke ca chi de log train_iou.
         stage2_train_ds = ImageOnlyDataset(
             img_ids=train_img_ids,
             img_dir=os.path.join('inputs', args.target, 'train', 'images'),
@@ -392,9 +453,10 @@ def main():
 
     for epoch in range(n_epochs):
         teacher_manager.set_progress(epoch / max(1, n_epochs - 1))
-        train_log = sfuda_task_multiteacher(stage2_train_loader, teacher_manager, tgt_model, criterion,
-                                             tgt_optimizer, args.ensemble_mode, class_balance_tracker,
-                                             labels_available=(early_stopper is None))
+        train_log = sfuda_task_multiteacher(
+            stage2_train_loader, teacher_manager, tgt_model, criterion,
+            tgt_optimizer, args.ensemble_mode, class_balance_tracker,
+            labels_available=(False if args.tier2_diagnostic else (early_stopper is None)))
         log_msg = 'epoch %d/%d - train_loss %.4f' % (epoch + 1, n_epochs, train_log['loss'])
         if 'iou' in train_log:
             log_msg += ' - train_iou %.4f' % train_log['iou']
@@ -408,12 +470,19 @@ def main():
         # vong lap Stage II, du chi de "tham khao". Chi khi KHONG bat co
         # che unsupervised (vd luc dieu tra hien tuong sup o stage2_epochs=20
         # ban dau) moi cho phep theo doi Dice moi epoch de chan doan.
-        if not args.early_stop_unsupervised:
+        # --tier2_diagnostic KHOA THEM buoc nay du early_stop_unsupervised
+        # co bat hay khong — Tier 2 tuyet doi khong duoc cham val_loader.
+        if not args.early_stop_unsupervised and not args.tier2_diagnostic:
             tgt_model.eval()
             epoch_val_log = validate(val_loader, tgt_model, criterion)
             tgt_model.train()
             print('  -> [Theo doi - CHI THAM KHAO, khong dung de quyet dinh] Dice sau epoch %d: %.4f' %
                   (epoch + 1, epoch_val_log['dice']))
+
+        if args.tier2_diagnostic:
+            epoch_ckpt_path = os.path.join(args.tier2_ckpt_dir, f'epoch_{epoch + 1}.pth')
+            torch.save(tgt_model.state_dict(), epoch_ckpt_path)
+            print(f"[TIER2] Da luu epoch_{epoch + 1} vao {epoch_ckpt_path}")
 
         if early_stopper is not None:
             should_stop = early_stopper.check(tgt_model, image_only_loader, epoch + 1)
@@ -423,6 +492,13 @@ def main():
                 print(f"[EarlyStop-KGS] DUNG SOM tai epoch {epoch+1} (phat hien bat on lien tiep). "
                       f"Quay ve checkpoint epoch {restored_epoch}.")
                 break
+
+    if args.tier2_diagnostic:
+        print("")
+        print(f"[TIER2] Hoan tat — da luu epoch_0..epoch_{actual_epochs_run} vao "
+              f"{args.tier2_ckpt_dir}. Bo qua validate/save/results_csv thong thuong "
+              f"(Tier 2 khong doc nhan, khong can Dice cuoi).")
+        return
 
     print("")
     print("Performing adapted target model evaluation...!!!")
