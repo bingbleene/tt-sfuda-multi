@@ -1,0 +1,153 @@
+"""Launcher for TT-SFUDA 3D that leaves tt_sfuda_3d.py / utils/ untouched.
+
+It imports the original module, re-uses its functions (sfuda_target, sfuda_task, validate, ...) and only
+re-implements `main()` so that
+  * paths come from the command line (no hard-coded /media/vibsss/... paths),
+  * several evaluation lists can be scored in ONE adaptation run
+    (source-only 'direct' score before adaptation, 'tt' score after Stage I + II),
+  * results are written to a json file.
+
+Example:
+  python run_tt_sfuda_3d.py --cfg unet_t2 --data_dir /kaggle/working/data/train/all \
+      --train_dir /kaggle/working/ckpts --valid_list val_s2001.txt,all.txt --out_json res/unet_t2.json
+"""
+import argparse
+import json
+import logging
+import os
+import re
+import sys
+import time
+
+import yaml
+
+# utils/parser.py calls yaml.load(f) without Loader -> error on PyYAML>=6. Patch here, not in the repo.
+_yaml_load = yaml.load
+yaml.load = lambda stream, Loader=None, **kw: _yaml_load(stream, Loader=Loader or yaml.FullLoader, **kw)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# tt_sfuda_3d.py gốc import `data`; package của mình tên `brats_data` (thư mục `data/` bị .gitignore) nên đăng ký lại dưới tên `data`
+import importlib
+sys.modules['data'] = importlib.import_module('brats_data')
+for _sub in ('datasets', 'sampler', 'data_utils', 'transforms'):
+    sys.modules['data.' + _sub] = importlib.import_module('brats_data.' + _sub)
+import torch                                   # noqa: E402
+import torch.optim as optim                    # noqa: E402
+from torch.utils.data import DataLoader        # noqa: E402
+
+import tt_sfuda_3d as T                        # noqa: E402  (original, unmodified)
+from utils import Parser                       # noqa: E402
+
+TGT_NUM = {"unet_t1": 1, "unet_t2": 0, "unet_flair": 3}   # same mapping as tt_sfuda_3d.main()
+_PAT = re.compile(r"Adapt to \w+\s+whole: ([\d.]+), core: ([\d.]+), enhancing: ([\d.]+)")
+
+
+class _Grab(logging.Handler):
+    """Keeps the last 'Adapt to ... whole/core/enhancing' line that validate() logs."""
+    def __init__(self):
+        super().__init__()
+        self.last = None
+
+    def emit(self, record):
+        m = _PAT.search(record.getMessage())
+        if m:
+            self.last = [100 * float(v) for v in m.groups()]
+
+
+def run(args, valid_lists, grab):
+    tgt_num = TGT_NUM[args.cfg]
+    model_file = os.path.join(args.getdir(), args.ckpt)
+
+    msrc_model = T.models.unet.Unet_wo()
+    msrc_model.load_state_dict(torch.load(model_file)['state_dict'])
+    msrc_model = msrc_model.cuda()
+    msrc_model.train()
+
+    tgt_model = T.models.unet.Unet_wo()
+    src_optimizer = optim.Adam(filter(lambda p: p.requires_grad, msrc_model.parameters()),
+                               lr=args.opt_params.lr, weight_decay=0.0001)
+    tgt_optimizer = optim.Adam(filter(lambda p: p.requires_grad, tgt_model.parameters()),
+                               lr=args.opt_params.lr, weight_decay=0.0001)
+
+    pseudo_model = T.models.unet.Unet_wo()
+    pseudo_model.load_state_dict(msrc_model.state_dict())
+    pseudo_model.cuda()
+    pseudo_model.eval()
+
+    Dataset = getattr(T.datasets, args.dataset)
+    train_set = Dataset(os.path.join(args.data_dir, args.train_list), root=args.data_dir,
+                        for_train=True, transforms=args.train_transforms)
+    break_pt = 25
+    num_iters = (len(train_set) * 1) // args.batch_size
+    train_loader = DataLoader(train_set, batch_size=1, collate_fn=train_set.collate,
+                              sampler=T.CycleSampler(len(train_set), num_iters * args.batch_size),
+                              num_workers=args.workers, pin_memory=True, worker_init_fn=T.init_fn)
+
+    valid = {}
+    for name in valid_lists:
+        vs = Dataset(os.path.join(args.data_dir, name), root=args.data_dir, for_train=False,
+                     return_target=True, transforms=args.test_transforms)
+        valid[os.path.splitext(name)[0]] = (DataLoader(vs, batch_size=1, shuffle=False,
+                                                       collate_fn=vs.collate, num_workers=4,
+                                                       pin_memory=True), vs)
+    criterion = getattr(T.criterions, args.criterion)
+    res = {"direct": {}, "tt": {}}
+
+    def evaluate(model, key):
+        for tag, (vl, vs) in valid.items():
+            grab.last = None
+            T.validate(vl, model, '', vs.names, tgt_num=tgt_num, scoring=True, mode=key)
+            res[key][tag] = grab.last
+            print(f"[{key}] {tag}: WT/TC/ET = " + " / ".join(f"{v:.2f}" for v in grab.last), flush=True)
+
+    print("Source-only (Direct Testing) ...", flush=True)
+    evaluate(pseudo_model, "direct")
+
+    print("Stage I ...", flush=True)
+    t0 = time.time()
+    for _ in range(args.stage1):
+        T.sfuda_target(train_loader, pseudo_model, msrc_model, criterion, src_optimizer, break_pt, tgt_num)
+        torch.cuda.empty_cache()
+
+    msrc_model.eval()
+    tgt_model.load_state_dict(msrc_model.state_dict())
+    tgt_model.cuda()
+    tgt_model.train()
+
+    print("Stage II ...", flush=True)
+    for _ in range(args.stage2):
+        T.sfuda_task(train_loader, msrc_model, tgt_model, criterion, tgt_optimizer, break_pt, tgt_num)
+        torch.cuda.empty_cache()
+
+    print("TT-SFUDA evaluation ...", flush=True)
+    evaluate(msrc_model, "tt")
+    res["minutes"] = (time.time() - t0) / 60
+    return res
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--cfg', required=True, choices=list(TGT_NUM))
+    ap.add_argument('--data_dir', required=True, help='folder with all.txt, val*.txt and one sub-folder per case')
+    ap.add_argument('--train_dir', required=True, help='folder containing <cfg>/source_model.tar')
+    ap.add_argument('--valid_list', default='val.txt', help='comma separated list files inside data_dir')
+    ap.add_argument('--stage2', type=int, default=None, help='Stage-II epochs (repo default: 2, paper: 10)')
+    ap.add_argument('--keep_rate', type=float, default=None, help='EMA keep rate (repo default: 0.9, paper: 0.99)')
+    ap.add_argument('--out_json', default=None)
+    cli = ap.parse_args()
+
+    args = Parser(cli.cfg, log='test').add_args(argparse.Namespace(cfg=cli.cfg))
+    args.data_dir, args.train_dir = cli.data_dir, cli.train_dir
+    args.ckpt = 'source_model.tar'
+    if cli.stage2 is not None:
+        args.stage2 = cli.stage2
+    if cli.keep_rate is not None:   # sfuda_task() hard-codes 0.9; override via the module attribute
+        _utm = T.update_teacher_model
+        T.update_teacher_model = lambda s, t, keep_rate=None: _utm(s, t, keep_rate=cli.keep_rate)
+
+    grab = _Grab()
+    logging.getLogger('').addHandler(grab)
+    result = run(args, [x.strip() for x in cli.valid_list.split(',')], grab)
+    if cli.out_json:
+        os.makedirs(os.path.dirname(os.path.abspath(cli.out_json)), exist_ok=True)
+        json.dump(result, open(cli.out_json, 'w'), indent=1)
