@@ -53,6 +53,78 @@ class _Grab(logging.Handler):
         if m:
             self.last = [100 * float(v) for v in m.groups()]
 
+def _rng_get():
+    return torch.get_rng_state(), (torch.cuda.get_rng_state() if torch.cuda.is_available() else None)
+
+
+def _rng_set(s):
+    torch.set_rng_state(s[0])
+    if s[1] is not None:
+        torch.cuda.set_rng_state(s[1])
+
+
+def chunked_backward(model, aug_input, ps_output, chunk=1):
+    """Same loss as tt_sfuda_3d.sfuda_target but backward `chunk` volumes at a time (~1/5 memory).
+    Pass 1 (no grad) gets the pooled Dice sums A, B; pass 2 backprops each chunk with A, B fixed, so the
+    summed gradient equals the full-batch gradient. Dropout masks are replayed via the saved RNG state."""
+    eps = T.criterions.eps
+    n = aug_input.shape[0]
+    t_c = [(ps_output == c).float() for c in range(1, 5)]
+    chunks = [(s, min(s + chunk, n)) for s in range(0, n, chunk)]
+    dev = ps_output.device
+    A = torch.zeros(4, device=dev); B = torch.zeros(4, device=dev)
+    states = []
+    with torch.no_grad():
+        for s, e in chunks:
+            states.append(_rng_get())
+            p = torch.softmax(model(aug_input[s:e].cuda()), dim=1)
+            for c in range(4):
+                A[c] += (p[:, c + 1] * t_c[c]).sum()
+                B[c] += p[:, c + 1].sum()
+    B = B + torch.stack([t.sum() for t in t_c]) * n
+    den = B + eps
+    dice_sum = (1.0 - (2 * A + eps) / den).sum()
+    coef_a, coef_b = 2.0 / den, (2 * A + eps) / den ** 2
+    ce_tot = ent_tot = 0.0
+    for k, (s, e) in enumerate(chunks):
+        _rng_set(states[k])
+        m = e - s
+        out = model(aug_input[s:e].cuda())
+        ce = torch.nn.functional.cross_entropy(out, ps_output.repeat(m, 1, 1, 1))
+        ent = T.softmax_entropy_loss(out)
+        p = torch.softmax(out, dim=1)
+        dterm = sum(-coef_a[c] * (p[:, c + 1] * t_c[c]).sum() + coef_b[c] * p[:, c + 1].sum() for c in range(4))
+        (0.01 * (ce * m / n + 0.25 * dterm) + ent * m / n).backward()
+        ce_tot += ce.item() * m / n
+        ent_tot += ent.item() * m / n
+    return 0.01 * (ce_tot + 0.25 * dice_sum.item()) + ent_tot
+
+
+def sfuda_target_chunked(train_loader, pseduo_model, msrc_model, criterion, optimizer, break_pt, tgt_num, chunk=1):
+    """Drop-in replacement of tt_sfuda_3d.sfuda_target (Stage I) with low memory."""
+    assert criterion is T.criterions.cross_entropy_dice, "chunked Stage I is written for cross_entropy_dice"
+    meter = T.AverageMeter()
+    pseduo_model.eval(); msrc_model.cuda(); msrc_model.train()
+    pbar = T.tqdm(total=break_pt)
+    for i, data in enumerate(train_loader):
+        data = [t.cuda(non_blocking=True) for t in data]
+        x = data[0]
+        input = x[:, tgt_num, :, :, :]
+        aug_input = T.build_pseduo_augmentation(input.cpu().numpy())
+        with torch.no_grad():
+            aug_output = pseduo_model(aug_input.cuda())
+            ps_output = T.uncert_voting(aug_output.detach())
+        del aug_output
+        optimizer.zero_grad()
+        loss = chunked_backward(msrc_model, aug_input, ps_output, chunk)
+        optimizer.step()
+        meter.update(loss, input.size(0))
+        pbar.set_postfix(T.OrderedDict([('loss', meter.avg)]))
+        pbar.update(1)
+        if i == break_pt:
+            break
+    pbar.close()
+    return T.OrderedDict([('loss', meter.avg)])
 
 def run(args, valid_lists, grab):
     tgt_num = TGT_NUM[args.cfg]
@@ -108,7 +180,10 @@ def run(args, valid_lists, grab):
     print("Stage I ...", flush=True)
     t0 = time.time()
     for _ in range(args.stage1):
-        T.sfuda_target(train_loader, pseudo_model, msrc_model, criterion, src_optimizer, break_pt, tgt_num)
+        if args.chunk > 0:
+            sfuda_target_chunked(train_loader, pseudo_model, msrc_model, criterion, src_optimizer, break_pt, tgt_num, args.chunk)
+        else:
+            T.sfuda_target(train_loader, pseudo_model, msrc_model, criterion, src_optimizer, break_pt, tgt_num)
         torch.cuda.empty_cache()
 
     msrc_model.eval()
@@ -136,12 +211,14 @@ if __name__ == '__main__':
     ap.add_argument('--stage2', type=int, default=None, help='Stage-II epochs (repo default: 2, paper: 10)')
     ap.add_argument('--keep_rate', type=float, default=None, help='EMA keep rate (repo default: 0.9, paper: 0.99)')
     ap.add_argument('--out_json', default=None)
+    ap.add_argument('--chunk', type=int, default=1, help='Stage I: so khoi moi lan backward (1 = vua GPU 15GB; 0 = goc, batch 5)')
     ap.add_argument('--direct_only', action='store_true', help='chi cham source-only, khong adaptation')
     cli = ap.parse_args()
 
     args = Parser(cli.cfg, log='test').add_args(argparse.Namespace(cfg=cli.cfg))
     args.data_dir, args.train_dir = cli.data_dir, cli.train_dir
     args.ckpt = 'source_model.tar'
+    args.chunk = cli.chunk
     args.direct_only = cli.direct_only
     if cli.stage2 is not None:
         args.stage2 = cli.stage2
