@@ -24,7 +24,7 @@ from torch.utils.data.dataloader import default_collate
 from .transforms import *  # noqa: F401,F403  (needed by eval of YAML transform strings)
 
 MODALITIES = ("flair", "t1ce", "t1", "t2")  # channel order expected by tt_sfuda_3d.py
-NORMALIZE = "clip_zscore"  # 'clip_zscore' | 'zscore' | 'none'
+NORMALIZE = "dmfnet"  # 'dmfnet' | 'zscore' | 'none'
 CLIP_PCT = (0.2, 99.8)
 
 
@@ -37,22 +37,19 @@ def _find(case_dir, case, suffix):
 
 
 def normalize_volume(v, mode=NORMALIZE):
-    """v: (H,W,D) float32. Returns normalised copy; zero voxels stay zero."""
+    """DMFNet-style: clip 0.2-99.8 percentile cua nao (v>0), roi tru/chia mean/std cua nao tren CA khoi (nen != 0)."""
     v = v.astype(np.float32, copy=True)
     if mode == "none":
         return v
     mask = v > 0
     if not mask.any():
         return v
-    vals = v[mask]
-    if mode == "clip_zscore":
-        lo, hi = np.percentile(vals, CLIP_PCT)
+    if mode == "dmfnet":
+        lo, hi = np.percentile(v[mask], CLIP_PCT)
         v[mask & (v < lo)] = lo
         v[mask & (v > hi)] = hi
-        vals = v[mask]
-    mean, std = vals.mean(), vals.std()
-    v[mask] = (vals - mean) / (std + 1e-8)
-    return v
+    vals = v[mask]
+    return (v - vals.mean()) / (vals.std() + 1e-8)
 
 
 class SingleData(Dataset):

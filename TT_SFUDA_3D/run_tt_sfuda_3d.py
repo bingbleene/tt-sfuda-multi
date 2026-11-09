@@ -102,6 +102,8 @@ def run(args, valid_lists, grab):
 
     print("Source-only (Direct Testing) ...", flush=True)
     evaluate(pseudo_model, "direct")
+    if args.direct_only:
+          return res
 
     print("Stage I ...", flush=True)
     t0 = time.time()
@@ -134,11 +136,13 @@ if __name__ == '__main__':
     ap.add_argument('--stage2', type=int, default=None, help='Stage-II epochs (repo default: 2, paper: 10)')
     ap.add_argument('--keep_rate', type=float, default=None, help='EMA keep rate (repo default: 0.9, paper: 0.99)')
     ap.add_argument('--out_json', default=None)
+    ap.add_argument('--direct_only', action='store_true', help='chi cham source-only, khong adaptation')
     cli = ap.parse_args()
 
     args = Parser(cli.cfg, log='test').add_args(argparse.Namespace(cfg=cli.cfg))
     args.data_dir, args.train_dir = cli.data_dir, cli.train_dir
     args.ckpt = 'source_model.tar'
+    args.direct_only = cli.direct_only
     if cli.stage2 is not None:
         args.stage2 = cli.stage2
     if cli.keep_rate is not None:   # sfuda_task() hard-codes 0.9; override via the module attribute
