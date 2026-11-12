@@ -211,6 +211,7 @@ if __name__ == '__main__':
     ap.add_argument('--stage2', type=int, default=None, help='Stage-II epochs (repo default: 2, paper: 10)')
     ap.add_argument('--keep_rate', type=float, default=None, help='EMA keep rate (repo default: 0.9, paper: 0.99)')
     ap.add_argument('--out_json', default=None)
+    ap.add_argument('--lr', type=float, default=None, help='learning rate (repo yaml: 1e-5, paper: 1e-4)')
     ap.add_argument('--chunk', type=int, default=1, help='Stage I: so khoi moi lan backward (1 = vua GPU 15GB; 0 = goc, batch 5)')
     ap.add_argument('--direct_only', action='store_true', help='chi cham source-only, khong adaptation')
     cli = ap.parse_args()
@@ -222,6 +223,8 @@ if __name__ == '__main__':
     args.direct_only = cli.direct_only
     if cli.stage2 is not None:
         args.stage2 = cli.stage2
+    if cli.lr is not None:
+        args.opt_params.lr = cli.lr
     if cli.keep_rate is not None:   # sfuda_task() hard-codes 0.9; override via the module attribute
         _utm = T.update_teacher_model
         T.update_teacher_model = lambda s, t, keep_rate=None: _utm(s, t, keep_rate=cli.keep_rate)
